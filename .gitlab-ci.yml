@@ -1,0 +1,35 @@
+stages:
+  - generate
+
+Generate CLI:
+  stage: generate
+  image: registry.hpc.ut.ee/mirror/library/rust:1.88-bookworm
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "pipeline"'
+    - if: '$CI_PIPELINE_SOURCE == "trigger"'
+    - if: '$CI_PIPELINE_SOURCE == "web"'
+  cache:
+    key: cargo
+    paths:
+      - .cargo/registry
+  variables:
+    CARGO_HOME: "$CI_PROJECT_DIR/.cargo"
+  before_script:
+    - apt-get update && apt-get install -y --no-install-recommends git
+    - git config --global user.name "$GITLAB_USER_NAME"
+    - git config --global user.email "$GITLAB_USER_EMAIL"
+  script:
+    - set -e
+    # Cross-project clone: uses GITLAB_TOKEN (not CI_JOB_TOKEN), which is
+    # the pattern already proven elsewhere in this org (see api-docs'
+    # "Upload OpenAPI schema..." job) -- CI_JOB_TOKEN's cross-project access
+    # is scoped per-project and isn't reliably allow-listed, which is
+    # exactly what broke .fetch-openapi-schema's internal-API path earlier.
+    - git clone --depth 1 "https://gitlab-ci-token:${GITLAB_TOKEN}@${CI_SERVER_HOST}/waldur/rs-client.git" ../rs-client
+    - git clone "https://gitlab-ci-token:${GITLAB_TOKEN}@${CI_SERVER_HOST}/waldur/waldur-cli.git" ../waldur-cli
+    - cargo run --release -- ../rs-client ../waldur-cli
+    - cd ../waldur-cli
+    - |
+      git add src/commands src/cli.rs
+      git diff --cached --quiet && echo "No changes" || git commit -m "chore: regenerate CLI command surface from rs-client"
+    - git push origin HEAD:main || echo "main already up to date in waldur-cli"

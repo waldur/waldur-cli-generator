@@ -1,0 +1,184 @@
+# Command manifest for waldur-cli-generator.
+#
+# Single source of truth for what waldur-cli's command surface covers. Each
+# `commands.*` value must be the exact name of a `pub async fn` on rs-client's
+# `HttpClient` (see ~/waldur/rs-client/src/generated/client.rs) -- the
+# generator parses that method's real signature with `syn` rather than
+# trusting anything declared here about its shape.
+#
+# Deliberately not 1:1 with rs-client's ~451 operations: only list/get/create/
+# update/delete are covered, and only where rs-client actually exposes a
+# direct REST operation for it. OpenStack tenant/instance/volume creation and
+# deletion happen through Waldur's marketplace ordering flow, which is outside
+# rs-client's generated surface (rs-client is itself scoped to OpenStack +
+# team-management tags, excluding marketplace-orders) -- so those three
+# resources are read/update only here. Action-style operations (start/stop/
+# attach/approve/...) aren't covered by this generator yet; add a `commands.*`
+# key and extend the generator's Verb enum to support one when needed.
+#
+# `columns` lists the fields shown in the default human-readable table,
+# verified against the real generated struct fields in types.rs.
+
+[[group]]
+name = "openstack"
+about = "Manage OpenStack resources"
+
+  [[group.resource]]
+  name = "tenant"
+  about = "OpenStack tenants"
+  columns = ["uuid", "name", "state", "customer_name"]
+    [group.resource.commands]
+    list = "openstack_tenants_list"
+    get = "openstack_tenants_retrieve"
+    update = "openstack_tenants_update"
+
+  [[group.resource]]
+  name = "instance"
+  about = "OpenStack instances (VMs)"
+  columns = ["uuid", "name", "state", "project_name"]
+    [group.resource.commands]
+    list = "openstack_instances_list"
+    get = "openstack_instances_retrieve"
+    update = "openstack_instances_update"
+
+  [[group.resource]]
+  name = "volume"
+  about = "OpenStack volumes"
+  columns = ["uuid", "name", "state", "size"]
+    [group.resource.commands]
+    list = "openstack_volumes_list"
+    get = "openstack_volumes_retrieve"
+    update = "openstack_volumes_update"
+
+  [[group.resource]]
+  name = "network"
+  about = "OpenStack networks"
+  columns = ["uuid", "name", "state", "project_name"]
+    [group.resource.commands]
+    list = "openstack_networks_list"
+    get = "openstack_networks_retrieve"
+    update = "openstack_networks_update"
+    delete = "openstack_networks_destroy"
+
+  [[group.resource]]
+  name = "subnet"
+  about = "OpenStack subnets"
+  columns = ["uuid", "name", "state", "cidr"]
+    [group.resource.commands]
+    list = "openstack_subnets_list"
+    get = "openstack_subnets_retrieve"
+    update = "openstack_subnets_update"
+    delete = "openstack_subnets_destroy"
+
+  [[group.resource]]
+  name = "security-group"
+  about = "OpenStack security groups"
+  columns = ["uuid", "name", "state", "project_name"]
+    [group.resource.commands]
+    list = "openstack_security_groups_list"
+    get = "openstack_security_groups_retrieve"
+    update = "openstack_security_groups_update"
+    delete = "openstack_security_groups_destroy"
+
+  [[group.resource]]
+  name = "floating-ip"
+  about = "OpenStack floating IPs"
+  columns = ["uuid", "address", "state", "project_name"]
+    [group.resource.commands]
+    list = "openstack_floating_ips_list"
+    get = "openstack_floating_ips_retrieve"
+    delete = "openstack_floating_ips_destroy"
+
+[[group]]
+name = "team"
+about = "Manage team membership and organization access"
+
+  [[group.resource]]
+  name = "customer"
+  about = "Customers (organizations)"
+  columns = ["uuid", "name", "abbreviation", "state"]
+    [group.resource.commands]
+    list = "customers_list"
+    get = "customers_retrieve"
+    create = "customers_create"
+    update = "customers_update"
+    delete = "customers_destroy"
+
+  [[group.resource]]
+  name = "project"
+  about = "Projects"
+  columns = ["uuid", "name", "customer_name", "description"]
+    [group.resource.commands]
+    list = "projects_list"
+    get = "projects_retrieve"
+    create = "projects_create"
+    update = "projects_update"
+    delete = "projects_destroy"
+
+  [[group.resource]]
+  name = "user"
+  about = "Users"
+  columns = ["uuid", "username", "full_name", "email"]
+    [group.resource.commands]
+    list = "users_list"
+    get = "users_retrieve"
+    create = "users_create"
+    update = "users_update"
+    delete = "users_destroy"
+
+  [[group.resource]]
+  name = "role"
+  about = "Roles"
+  columns = ["uuid", "name", "description"]
+    [group.resource.commands]
+    list = "roles_list"
+    get = "roles_retrieve"
+    create = "roles_create"
+    update = "roles_update"
+    delete = "roles_destroy"
+
+  [[group.resource]]
+  name = "user-invitation"
+  about = "User invitations"
+  columns = ["uuid", "email", "role_name", "state"]
+    [group.resource.commands]
+    list = "user_invitations_list"
+    get = "user_invitations_retrieve"
+    create = "user_invitations_create"
+    update = "user_invitations_update"
+    delete = "user_invitations_destroy"
+
+  [[group.resource]]
+  name = "organization-group"
+  about = "Organization groups"
+  columns = ["uuid", "name", "parent_uuid"]
+    [group.resource.commands]
+    list = "organization_groups_list"
+    get = "organization_groups_retrieve"
+    create = "organization_groups_create"
+    update = "organization_groups_update"
+    delete = "organization_groups_destroy"
+
+  [[group.resource]]
+  name = "customer-permissions-review"
+  about = "Customer permission reviews (read-only)"
+  columns = ["uuid", "customer_name", "is_pending"]
+    [group.resource.commands]
+    list = "customer_permissions_reviews_list"
+    get = "customer_permissions_reviews_retrieve"
+
+  [[group.resource]]
+  name = "project-permissions-review"
+  about = "Project permission reviews (read-only)"
+  columns = ["uuid", "project_name", "is_pending"]
+    [group.resource.commands]
+    list = "project_permissions_reviews_list"
+    get = "project_permissions_reviews_retrieve"
+
+  [[group.resource]]
+  name = "user-permission-request"
+  about = "User permission requests (read-only)"
+  columns = ["uuid", "project_name", "role_name", "state"]
+    [group.resource.commands]
+    list = "user_permission_requests_list"
+    get = "user_permission_requests_retrieve"

@@ -1,0 +1,20 @@
+[package]
+name = "waldur-cli-generator"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Generates waldur-cli's command surface by parsing rs-client's generated methods"
+publish = false
+
+[[bin]]
+name = "waldur-cli-generator"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+proc-macro2 = "1"
+quote = "1"
+syn = { version = "2", features = ["full", "extra-traits"] }
+prettyplease = "0.2"
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
