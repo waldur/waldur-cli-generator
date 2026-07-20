@@ -1,0 +1,1 @@
+# waldur-cli-generator
