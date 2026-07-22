@@ -31,6 +31,39 @@ struct FieldPlan {
     is_path_uuid: bool,
 }
 
+/// Builds a `query_params.push((name, value))` statement for one filter arg,
+/// used by the `list` verb's auto-pagination path instead of a direct call
+/// (see `generate_resource_module`'s `is_list` branch). Returns `None` for
+/// `page`/`page_size` (the pagination helper manages those itself) and for
+/// kinds that can't sensibly be a query filter (JSON bodies, skipped params)
+/// -- list methods shouldn't have those, but silently omitting a filter is
+/// safer than failing generation over it.
+fn query_param_stmt(param: &crate::extract::ExtractedParam) -> Option<TokenStream> {
+    if param.name == "page" || param.name == "page_size" {
+        return None;
+    }
+    let ident = format_ident!("{}", param.name);
+    let name = &param.name;
+    match &param.kind {
+        ParamKind::OptionalStr => Some(quote! {
+            if let Some(v) = &args.#ident {
+                query_params.push((#name.to_string(), v.clone()));
+            }
+        }),
+        ParamKind::OptionalBool => Some(quote! {
+            if let Some(v) = args.#ident {
+                query_params.push((#name.to_string(), v.to_string()));
+            }
+        }),
+        ParamKind::OptionalI64 => Some(quote! {
+            if let Some(v) = args.#ident {
+                query_params.push((#name.to_string(), v.to_string()));
+            }
+        }),
+        _ => None,
+    }
+}
+
 fn plan_param(param: &crate::extract::ExtractedParam) -> Result<FieldPlan> {
     let ident = format_ident!("{}", param.name);
     Ok(match &param.kind {
@@ -138,13 +171,29 @@ fn generate_resource_module(resource: &Resource, methods: &HashMap<String, Extra
             }
             let plan = plan_param(param)
                 .with_context(|| format!("in resource `{}`, verb `{verb}` ({method_name})", resource.name))?;
-            if !plan.field_def.is_empty() {
+            // `list` always auto-paginates now (see the `is_list` branch
+            // below), so page/page_size are no longer meaningful flags --
+            // dropping their field defs here keeps them out of --help
+            // instead of leaving silently-ignored dead flags behind.
+            let is_paging_field = *verb == "list" && (param.name == "page" || param.name == "page_size");
+            if !plan.field_def.is_empty() && !is_paging_field {
                 field_defs.push(plan.field_def);
             }
             call_exprs.push(plan.call_expr);
             if plan.is_path_uuid && uuid_field.is_none() {
                 uuid_field = Some(format_ident!("{}", param.name));
             }
+        }
+        // Client-side only -- not one of rs-client's own method params (it
+        // doesn't have a "limit" concept), added here so `list` can bound a
+        // huge auto-paginated fetch instead of always fetching everything.
+        if *verb == "list" {
+            field_defs.push(quote! {
+                /// Stop after this many items (across however many pages that
+                /// takes), instead of fetching the complete result
+                #[arg(long)]
+                pub limit: Option<i64>,
+            });
         }
 
         let verb_pascal = pascal_case(verb);
@@ -159,7 +208,24 @@ fn generate_resource_module(resource: &Resource, methods: &HashMap<String, Extra
 
         let call = quote! { client.#method_ident(#(#call_exprs),*).await? };
 
-        let output_stmt = if *verb == "delete" {
+        let output_stmt = if *verb == "list" {
+            let list_path = method.list_path.as_deref().with_context(|| {
+                format!(
+                    "resource `{}`, verb `list` ({method_name}): couldn't find this method's \
+                     REST path (expected a \"/api/...\" literal in its body) -- needed to \
+                     auto-paginate",
+                    resource.name
+                )
+            })?;
+            let query_param_stmts: Vec<TokenStream> =
+                method.params.iter().filter_map(query_param_stmt).collect();
+            quote! {
+                let mut query_params: Vec<(String, String)> = Vec::new();
+                #(#query_param_stmts)*
+                let result = crate::pagination::fetch_all(base_url, token, #list_path, &query_params, args.limit).await?;
+                crate::output::print_result(&result, COLUMNS, format)?;
+            }
+        } else if *verb == "delete" {
             let uuid_ident = uuid_field.unwrap_or_else(|| format_ident!("uuid"));
             quote! {
                 let _ = #call;
@@ -241,6 +307,8 @@ fn generate_resource_module(resource: &Resource, methods: &HashMap<String, Extra
 
         pub async fn run(
             client: &HttpClient,
+            base_url: &str,
+            token: Option<&str>,
             command: #resource_enum_ident,
             format: crate::output::OutputFormat,
         ) -> anyhow::Result<()> {
@@ -346,7 +414,7 @@ fn generate_cli_file(manifest: &Manifest) -> Result<String> {
             });
             resource_arms.push(quote! {
                 #group_enum_ident::#resource_variant_ident(cmd) => {
-                    crate::commands::#group_mod::#resource_mod::run(client, cmd, format).await
+                    crate::commands::#group_mod::#resource_mod::run(client, base_url, token, cmd, format).await
                 }
             });
         }
@@ -394,6 +462,8 @@ fn generate_cli_file(manifest: &Manifest) -> Result<String> {
 
         pub async fn dispatch(
             client: &waldur_client::HttpClient,
+            base_url: &str,
+            token: Option<&str>,
             command: GroupCommand,
             format: crate::output::OutputFormat,
         ) -> anyhow::Result<()> {

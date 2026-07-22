@@ -1,6 +1,7 @@
 use anyhow::{bail, Context, Result};
 use std::collections::{HashMap, HashSet};
-use syn::{File, FnArg, ImplItem, Item, Pat, Type};
+use syn::visit::{self, Visit};
+use syn::{File, FnArg, ImplItem, Item, Lit, Pat, Type};
 
 /// How a single rs-client method parameter maps onto the generated CLI.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -37,6 +38,58 @@ pub struct ExtractedParam {
 pub struct ExtractedMethod {
     pub name: String,
     pub params: Vec<ExtractedParam>,
+    /// The literal REST path (e.g. `/api/customers/`), for methods that
+    /// have one -- every top-level list/count method's body contains
+    /// exactly one such literal (`format!("{}{}", self.base_url, "/api/...")`).
+    /// Used by generated `list` commands to auto-paginate: rs-client's own
+    /// generated methods discard response headers before returning
+    /// (X-Result-Count/Link, needed to know when to stop), so the list verb
+    /// bypasses them and calls this path directly instead (see
+    /// `crate::pagination` in waldur-cli).
+    pub list_path: Option<String>,
+}
+
+/// Finds the first `"/api/..."` string literal in a function body -- every
+/// top-level list/count method has exactly one, the literal passed to
+/// `format!("{}{}", self.base_url, ...)` building its request URL.
+///
+/// This has to scan raw macro tokens rather than use syn's `Visit::
+/// visit_expr_lit`: `format!(...)`'s arguments are opaque `TokenStream` to
+/// syn (it doesn't know `format!`'s grammar), so a literal passed to it
+/// never becomes a parsed `syn::ExprLit` node in the first place -- confirmed
+/// by testing against rs-client's actual generated bodies, where the naive
+/// `visit_expr_lit` approach silently found nothing for every method.
+///
+/// Nested (per-resource-uuid) actions build their path with a *second*,
+/// inner `format!("...{}...", uuid)` call, which appears as a nested
+/// `Group` token rather than a top-level literal -- deliberately not
+/// descended into, so this only ever matches plain resource-root paths
+/// (exactly what list/count operate on).
+struct PathLitVisitor {
+    found: Option<String>,
+}
+
+impl<'ast> Visit<'ast> for PathLitVisitor {
+    fn visit_macro(&mut self, node: &'ast syn::Macro) {
+        if self.found.is_none() {
+            for tt in node.tokens.clone() {
+                let proc_macro2::TokenTree::Literal(lit) = tt else { continue };
+                let Ok(Lit::Str(s)) = syn::parse_str::<Lit>(&lit.to_string()) else { continue };
+                let value = s.value();
+                if value.starts_with("/api/") && !value.contains('{') {
+                    self.found = Some(value);
+                    break;
+                }
+            }
+        }
+        visit::visit_macro(self, node);
+    }
+}
+
+fn extract_list_path(method: &syn::ImplItemFn) -> Option<String> {
+    let mut visitor = PathLitVisitor { found: None };
+    visitor.visit_block(&method.block);
+    visitor.found
 }
 
 /// Parse `client.rs` and pull out the signatures of exactly the methods in
@@ -66,7 +119,8 @@ pub fn extract_methods(source: &str, wanted: &[String]) -> Result<HashMap<String
                     kind: classify_type(&pat_type.ty),
                 });
             }
-            found.insert(name.clone(), ExtractedMethod { name, params });
+            let list_path = extract_list_path(method);
+            found.insert(name.clone(), ExtractedMethod { name, params, list_path });
         }
     }
 

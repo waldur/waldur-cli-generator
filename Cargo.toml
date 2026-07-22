@@ -14,7 +14,7 @@ path = "src/main.rs"
 anyhow = "1"
 proc-macro2 = "1"
 quote = "1"
-syn = { version = "2", features = ["full", "extra-traits"] }
+syn = { version = "2", features = ["full", "extra-traits", "visit"] }
 prettyplease = "0.2"
 serde = { version = "1", features = ["derive"] }
 toml = "0.8"
