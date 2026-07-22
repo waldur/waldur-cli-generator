@@ -173,6 +173,14 @@ fn generate_resource_module(resource: &Resource, methods: &HashMap<String, Extra
                     crate::output::OutputFormat::Tsv => {
                         println!("true\t{}", args.#uuid_ident);
                     }
+                    crate::output::OutputFormat::Toon => {
+                        println!(
+                            "{}",
+                            serde_toon::to_string(
+                                &serde_json::json!({"deleted": true, "uuid": args.#uuid_ident}),
+                            )?
+                        );
+                    }
                 }
             }
         } else {
