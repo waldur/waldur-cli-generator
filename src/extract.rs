@@ -47,6 +47,13 @@ pub struct ExtractedMethod {
     /// bypasses them and calls this path directly instead (see
     /// `crate::pagination` in waldur-cli).
     pub list_path: Option<String>,
+    /// The type name of this method's `field: Option<Vec<XxxFieldEnum>>`
+    /// param, if it has one -- every resource's own generated FieldEnum
+    /// lists exactly the field names its API actually accepts for
+    /// server-side field selection (see `extract_enum_values`), used to
+    /// validate `--fields` client-side instead of silently sending a typo'd
+    /// name the server will just as silently ignore.
+    pub field_enum_name: Option<String>,
 }
 
 /// Finds the first `"/api/..."` string literal in a function body -- every
@@ -92,6 +99,24 @@ fn extract_list_path(method: &syn::ImplItemFn) -> Option<String> {
     visitor.found
 }
 
+/// Finds a param literally named `field` typed `Option<Vec<XxxFieldEnum>>`
+/// and returns `XxxFieldEnum`'s name, if the method has one.
+fn extract_field_enum_name(method: &syn::ImplItemFn) -> Option<String> {
+    for arg in &method.sig.inputs {
+        let FnArg::Typed(pat_type) = arg else { continue };
+        let Pat::Ident(pat_ident) = &*pat_type.pat else { continue };
+        if pat_ident.ident != "field" {
+            continue;
+        }
+        let ty = &*pat_type.ty;
+        let raw = quote::quote!(#ty).to_string().replace(' ', "");
+        if let Some(inner) = raw.strip_prefix("Option<Vec<").and_then(|s| s.strip_suffix(">>")) {
+            return Some(inner.to_string());
+        }
+    }
+    None
+}
+
 /// Parse `client.rs` and pull out the signatures of exactly the methods in
 /// `wanted` (the manifest's referenced method names), from `impl HttpClient`
 /// blocks. Errors if any wanted method isn't found at all -- a typo'd or
@@ -120,7 +145,16 @@ pub fn extract_methods(source: &str, wanted: &[String]) -> Result<HashMap<String
                 });
             }
             let list_path = extract_list_path(method);
-            found.insert(name.clone(), ExtractedMethod { name, params, list_path });
+            let field_enum_name = extract_field_enum_name(method);
+            found.insert(
+                name.clone(),
+                ExtractedMethod {
+                    name,
+                    params,
+                    list_path,
+                    field_enum_name,
+                },
+            );
         }
     }
 
@@ -138,6 +172,54 @@ pub fn extract_methods(source: &str, wanted: &[String]) -> Result<HashMap<String
     }
 
     Ok(found)
+}
+
+/// Parses `types.rs` and pulls the valid `--fields` values for one
+/// `XxxFieldEnum` -- the actual query-string value of each variant (its
+/// `#[serde(rename = "...")]`), not its Rust identifier (which can differ,
+/// e.g. a name collision suffixed to `Foo_2` while the wire value stays
+/// plain `"foo"`). Used to validate `--fields` client-side: Waldur's
+/// `RestrictedSerializerMixin` silently ignores unknown field names rather
+/// than rejecting them (confirmed against mastermind source), so a typo
+/// would otherwise fail silently -- either dropping just that field or,
+/// worse, falling back to returning the complete object if every field
+/// given was invalid.
+pub fn extract_enum_values(types_source: &str, enum_name: &str) -> Result<Vec<String>> {
+    let file: File = syn::parse_file(types_source).context("failed to parse rs-client's types.rs")?;
+    for item in &file.items {
+        let Item::Enum(item_enum) = item else { continue };
+        if item_enum.ident != enum_name {
+            continue;
+        }
+        let mut values = Vec::new();
+        for variant in &item_enum.variants {
+            let rename = variant.attrs.iter().find_map(|attr| {
+                if !attr.path().is_ident("serde") {
+                    return None;
+                }
+                let mut found = None;
+                let _ = attr.parse_nested_meta(|meta| {
+                    if meta.path.is_ident("rename") {
+                        let value = meta.value()?;
+                        let lit: syn::LitStr = value.parse()?;
+                        found = Some(lit.value());
+                    }
+                    Ok(())
+                });
+                found
+            });
+            let Some(value) = rename else {
+                bail!(
+                    "enum `{enum_name}` variant `{}` has no #[serde(rename = ...)] -- expected \
+                     every variant to have one (rs-client's own generation convention)",
+                    variant.ident
+                );
+            };
+            values.push(value);
+        }
+        return Ok(values);
+    }
+    bail!("enum `{enum_name}` not found in rs-client's types.rs")
 }
 
 fn classify_type(ty: &Type) -> ParamKind {

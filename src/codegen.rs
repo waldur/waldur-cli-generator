@@ -140,7 +140,11 @@ fn plan_param(param: &crate::extract::ExtractedParam) -> Result<FieldPlan> {
 }
 
 /// One resource's generated file: Args structs + Command enum + run().
-fn generate_resource_module(resource: &Resource, methods: &HashMap<String, ExtractedMethod>) -> Result<TokenStream> {
+fn generate_resource_module(
+    resource: &Resource,
+    methods: &HashMap<String, ExtractedMethod>,
+    field_enum_values: &HashMap<String, Vec<String>>,
+) -> Result<TokenStream> {
     let resource_pascal = pascal_case(&resource.name);
     let resource_enum_ident = format_ident!("{}Command", resource_pascal);
     let columns = &resource.columns;
@@ -194,14 +198,32 @@ fn generate_resource_module(resource: &Resource, methods: &HashMap<String, Extra
                 #[arg(long)]
                 pub limit: Option<i64>,
             });
-            field_defs.push(quote! {
-                /// Only fetch these fields from the server (comma-separated),
-                /// instead of the complete object -- avoids over-fetching.
-                /// Table output always does this already (using its own
-                /// display columns); for json/toon/tsv, which fetch the
-                /// complete object by default, this narrows what they get too.
-                #[arg(long, value_delimiter = ',')]
-                pub fields: Option<Vec<String>>,
+            let doc = "Only fetch these fields from the server (comma-separated), instead of \
+                       the complete object -- avoids over-fetching. Table output always does \
+                       this already (using its own display columns); for json/toon/tsv, which \
+                       fetch the complete object by default, this narrows what they get too.";
+            // Waldur's RestrictedSerializerMixin silently ignores unknown
+            // field names rather than rejecting them (confirmed against
+            // mastermind source) -- an all-invalid --fields list falls back
+            // to returning the complete object with no error at all. Validate
+            // against the resource's own FieldEnum values client-side instead
+            // of letting that happen silently, when we know what they are.
+            let valid_values = method.field_enum_name.as_ref().and_then(|name| field_enum_values.get(name));
+            field_defs.push(match valid_values {
+                Some(values) => quote! {
+                    #[doc = #doc]
+                    #[arg(
+                        long,
+                        value_delimiter = ',',
+                        value_parser = clap::builder::PossibleValuesParser::new([#(#values),*]),
+                    )]
+                    pub fields: Option<Vec<String>>,
+                },
+                None => quote! {
+                    #[doc = #doc]
+                    #[arg(long, value_delimiter = ',')]
+                    pub fields: Option<Vec<String>>,
+                },
             });
         }
 
@@ -250,7 +272,18 @@ fn generate_resource_module(resource: &Resource, methods: &HashMap<String, Extra
                     }
                 }
                 let result = crate::pagination::fetch_all(base_url, token, #list_path, &query_params, args.limit).await?;
-                crate::output::print_result(&result, COLUMNS, format)?;
+                // table/tsv render exactly these columns (json/toon ignore
+                // them, showing the complete fetched object regardless) --
+                // when --fields narrowed what was actually fetched, the
+                // display columns have to follow the same override, or
+                // table/tsv would show a column for every field COLUMNS
+                // expects but --fields didn't ask for, which the server
+                // response then doesn't have at all (rendering as blank).
+                let display_columns: Vec<&str> = match &args.fields {
+                    Some(fields) => fields.iter().map(String::as_str).collect(),
+                    None => COLUMNS.to_vec(),
+                };
+                crate::output::print_result(&result, &display_columns, format)?;
             }
         } else if *verb == "delete" {
             let uuid_ident = uuid_field.unwrap_or_else(|| format_ident!("uuid"));
@@ -369,14 +402,18 @@ pub struct GeneratedOutput {
     pub cli_source: String,
 }
 
-pub fn generate_all(manifest: &Manifest, methods: &HashMap<String, ExtractedMethod>) -> Result<GeneratedOutput> {
+pub fn generate_all(
+    manifest: &Manifest,
+    methods: &HashMap<String, ExtractedMethod>,
+    field_enum_values: &HashMap<String, Vec<String>>,
+) -> Result<GeneratedOutput> {
     let mut resources = Vec::new();
     let mut group_mod_decls: HashMap<String, String> = HashMap::new();
 
     for group in &manifest.group {
         let mut resource_mod_decls = Vec::new();
         for resource in &group.resource {
-            let tokens = generate_resource_module(resource, methods)
+            let tokens = generate_resource_module(resource, methods, field_enum_values)
                 .with_context(|| format!("generating group `{}` resource `{}`", group.name, resource.name))?;
             let file: syn::File = syn::parse2(tokens.clone()).with_context(|| {
                 format!(

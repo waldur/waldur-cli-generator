@@ -3,7 +3,7 @@ mod extract;
 mod manifest;
 
 use anyhow::{Context, Result};
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -45,7 +45,27 @@ fn main() -> Result<()> {
     let methods = extract::extract_methods(&client_source, &wanted)
         .context("extracting method signatures from rs-client")?;
 
-    let output = codegen::generate_all(&manifest, &methods).context("generating CLI source")?;
+    let types_rs_path = rs_client_dir.join("src/generated/types.rs");
+    let types_source = fs::read_to_string(&types_rs_path)
+        .with_context(|| format!("reading {}", types_rs_path.display()))?;
+
+    // Resolve valid --fields values for every list method that has a
+    // `field: Option<Vec<XxxFieldEnum>>` param, so codegen can validate
+    // --fields client-side instead of silently sending a bad name the
+    // server will just as silently ignore.
+    let mut field_enum_values: HashMap<String, Vec<String>> = HashMap::new();
+    for method in methods.values() {
+        let Some(enum_name) = &method.field_enum_name else { continue };
+        if field_enum_values.contains_key(enum_name) {
+            continue;
+        }
+        let values = extract::extract_enum_values(&types_source, enum_name)
+            .with_context(|| format!("resolving --fields values for method `{}`", method.name))?;
+        field_enum_values.insert(enum_name.clone(), values);
+    }
+
+    let output = codegen::generate_all(&manifest, &methods, &field_enum_values)
+        .context("generating CLI source")?;
 
     let commands_dir = waldur_cli_dir.join("src/commands");
     fs::create_dir_all(&commands_dir)
