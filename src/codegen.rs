@@ -170,6 +170,9 @@ fn generate_resource_module(resource: &Resource, methods: &HashMap<String, Extra
                     crate::output::OutputFormat::Table => {
                         println!("Deleted {}", args.#uuid_ident);
                     }
+                    crate::output::OutputFormat::Tsv => {
+                        println!("true\t{}", args.#uuid_ident);
+                    }
                 }
             }
         } else {
