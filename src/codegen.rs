@@ -139,11 +139,40 @@ fn build_path_expr(op: &ExtractedOperation) -> Result<TokenStream> {
     }
 }
 
+/// Statements binding `let path = ...;` for a create/update operation, where
+/// the path param (if any) is an `Option` positional -- enforced present here
+/// at runtime rather than by clap, so `--generate-skeleton` stays reachable
+/// without it. Assumes `anyhow::Context` is in scope (create/update import it).
+fn body_path_stmts(op: &ExtractedOperation) -> Result<TokenStream> {
+    match &op.path_param {
+        None => {
+            let path = &op.path;
+            Ok(quote! { let path = #path.to_string(); })
+        }
+        Some(param_name) => {
+            let placeholder = format!("{{{param_name}}}");
+            let (prefix, suffix) = op.path.split_once(&placeholder).with_context(|| {
+                format!(
+                    "operation `{}`: path `{}` doesn't contain its own path param `{{{param_name}}}`",
+                    op.operation_id, op.path
+                )
+            })?;
+            let ident = field_ident(param_name);
+            let msg = format!("this command requires a <{param_name}> argument");
+            Ok(quote! {
+                let #ident = args.#ident.as_deref().context(#msg)?;
+                let path = format!("{}{}{}", #prefix, #ident, #suffix);
+            })
+        }
+    }
+}
+
 /// One resource's generated file: Args structs + Command enum + run().
 fn generate_resource_module(
     resource: &Resource,
     operations: &HashMap<String, ExtractedOperation>,
     field_enum_values: &HashMap<String, Vec<String>>,
+    request_skeletons: &HashMap<String, String>,
 ) -> Result<TokenStream> {
     let resource_pascal = pascal_case(&resource.name);
     let resource_enum_ident = format_ident!("{}Command", resource_pascal);
@@ -151,6 +180,7 @@ fn generate_resource_module(
 
     let mut verb_variants = Vec::new();
     let mut verb_arms = Vec::new();
+    let mut skeleton_consts = Vec::new();
     let mut uses_context = false;
 
     for verb in KNOWN_VERBS {
@@ -177,10 +207,24 @@ fn generate_resource_module(
 
         let mut field_defs = Vec::new();
         let mut query_push_stmts = Vec::new();
+        // Struct-level attribute (e.g. the request-body arg group on
+        // create/update); empty for verbs that don't need one.
+        let mut struct_attr = quote! {};
+
+        let has_body = *verb == "create" || *verb == "update";
+        // A body verb with a path param (i.e. `update`) makes its uuid an
+        // optional positional so `--generate-skeleton` can run without it
+        // (mirrors AWS's skeleton bypassing required args); presence is then
+        // enforced at runtime for an actual update.
+        let uuid_optional = has_body && op.path_param.is_some();
 
         if let Some(path_param) = &op.path_param {
             let ident = field_ident(path_param);
-            field_defs.push(quote! { pub #ident: String, });
+            if uuid_optional {
+                field_defs.push(quote! { pub #ident: Option<String>, });
+            } else {
+                field_defs.push(quote! { pub #ident: String, });
+            }
         }
         if *verb == "list" {
             for param in &op.query_params {
@@ -196,7 +240,49 @@ fn generate_resource_module(
         }
         if *verb == "create" || *verb == "update" {
             uses_context = true;
-            field_defs.push(quote! { #[arg(long)] pub request: String, });
+            // AWS-style body input: inline JSON, a JSON/YAML file, or print a
+            // fillable template -- exactly one, enforced by a required arg
+            // group. Discoverable in --help without a flag per schema field.
+            field_defs.push(quote! {
+                /// Request body as inline JSON. Use --generate-skeleton for a
+                /// template, or --request-file to read it from a file.
+                #[arg(long)]
+                pub request: Option<String>,
+            });
+            field_defs.push(quote! {
+                /// Read the request body from a JSON or YAML file (e.g. a
+                /// filled-in --generate-skeleton template).
+                #[arg(long, value_name = "PATH")]
+                pub request_file: Option<std::path::PathBuf>,
+            });
+            field_defs.push(quote! {
+                /// Print a fillable request-body template and exit, instead of
+                /// sending a request (json or yaml; default json).
+                #[arg(long, value_enum, num_args = 0..=1, default_missing_value = "json", value_name = "FORMAT")]
+                pub generate_skeleton: Option<crate::request::SkeletonFormat>,
+            });
+            let group_name = format!("{}_{verb}_body", resource.name.replace('-', "_"));
+            struct_attr = quote! {
+                #[command(group(
+                    clap::ArgGroup::new(#group_name)
+                        .required(true)
+                        .args(["request", "request_file", "generate_skeleton"])
+                ))]
+            };
+            // Embed the fillable template (built from the schema at generation
+            // time) so --generate-skeleton needs no runtime schema access.
+            let type_name = op.request_body_type.as_deref().with_context(|| {
+                format!(
+                    "resource `{}`, verb `{verb}` ({method_name}): no request body schema \
+                     to build a --generate-skeleton template from",
+                    resource.name
+                )
+            })?;
+            let skeleton = request_skeletons.get(type_name).with_context(|| {
+                format!("internal error: no skeleton built for request type `{type_name}`")
+            })?;
+            let const_ident = format_ident!("{}_SKELETON", verb.to_uppercase());
+            skeleton_consts.push(quote! { const #const_ident: &str = #skeleton; });
         }
 
         // Client-side only -- not part of the schema (list has no "limit"
@@ -305,11 +391,18 @@ fn generate_resource_module(
             let request_ty: syn::Type = syn::parse_str(&format!("waldur_client::{request_ty_name}"))
                 .with_context(|| format!("invalid generated type name `{request_ty_name}`"))?;
             let method_expr = http_method_expr(op)?;
+            let const_ident = format_ident!("{}_SKELETON", verb.to_uppercase());
+            let path_stmts = body_path_stmts(op)?;
             quote! {
-                serde_json::from_str::<#request_ty>(&args.request)
-                    .with_context(|| format!("--{} is not valid JSON for the expected request body", stringify!(request)))?;
-                let path = #path_expr;
-                let result = crate::http::call_one(base_url, token, #method_expr, &path, Some(&args.request)).await?;
+                if let Some(fmt) = args.generate_skeleton {
+                    crate::request::print_skeleton(#const_ident, fmt)?;
+                    return Ok(());
+                }
+                let body = crate::request::load_body(args.request.as_deref(), args.request_file.as_deref())?;
+                serde_json::from_str::<#request_ty>(&body)
+                    .with_context(|| "the request body is not valid JSON for this resource's request schema".to_string())?;
+                #path_stmts
+                let result = crate::http::call_one(base_url, token, #method_expr, &path, Some(&body)).await?;
                 crate::output::print_result(&result, COLUMNS, format)?;
             }
         } else {
@@ -355,6 +448,7 @@ fn generate_resource_module(
         ARGS_STRUCTS.with(|cell| {
             cell.borrow_mut().push(quote! {
                 #[derive(clap::Args, Debug)]
+                #struct_attr
                 pub struct #args_ident {
                     #(#field_defs)*
                 }
@@ -384,6 +478,8 @@ fn generate_resource_module(
         #context_import
 
         const COLUMNS: &[&str; #columns_len] = &[#(#columns),*];
+
+        #(#skeleton_consts)*
 
         #[doc = #about]
         #[derive(clap::Subcommand, Debug)]
@@ -434,6 +530,7 @@ pub fn generate_all(
     manifest: &Manifest,
     operations: &HashMap<String, ExtractedOperation>,
     field_enum_values: &HashMap<String, Vec<String>>,
+    request_skeletons: &HashMap<String, String>,
 ) -> Result<GeneratedOutput> {
     let mut resources = Vec::new();
     let mut group_mod_decls: HashMap<String, String> = HashMap::new();
@@ -441,7 +538,7 @@ pub fn generate_all(
     for group in &manifest.group {
         let mut resource_mod_decls = Vec::new();
         for resource in &group.resource {
-            let tokens = generate_resource_module(resource, operations, field_enum_values)
+            let tokens = generate_resource_module(resource, operations, field_enum_values, request_skeletons)
                 .with_context(|| format!("generating group `{}` resource `{}`", group.name, resource.name))?;
             let file: syn::File = syn::parse2(tokens.clone()).with_context(|| {
                 format!(

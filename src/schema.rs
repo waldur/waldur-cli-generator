@@ -64,6 +64,18 @@ pub struct RawSchema {
     pub reference: Option<String>,
     #[serde(rename = "enum", default)]
     pub enum_values: Option<Vec<String>>,
+    #[serde(default)]
+    pub properties: Option<HashMap<String, RawSchema>>,
+    #[serde(default)]
+    pub required: Option<Vec<String>>,
+    #[serde(rename = "readOnly", default)]
+    pub read_only: bool,
+    #[serde(rename = "allOf", default)]
+    pub all_of: Option<Vec<RawSchema>>,
+    #[serde(rename = "oneOf", default)]
+    pub one_of: Option<Vec<RawSchema>>,
+    #[serde(rename = "anyOf", default)]
+    pub any_of: Option<Vec<RawSchema>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -278,4 +290,119 @@ pub fn extract_enum_values(doc: &OpenApiDoc, schema_name: &str) -> Result<Vec<St
         .enum_values
         .clone()
         .with_context(|| format!("schema `{schema_name}` has no `enum` values"))
+}
+
+/// Recursion cap for skeleton building -- guards against a self-referential
+/// schema (`$ref` cycle the `seen` set doesn't cover, e.g. via an array of
+/// the same type) producing an unbounded template.
+const SKELETON_MAX_DEPTH: usize = 12;
+
+/// Builds a fillable request-body template (AWS `--generate-cli-skeleton`
+/// style): every writable field of `schema_name` with a type-appropriate
+/// placeholder, as pretty-printed JSON. Emitted into the generated command
+/// so `--generate-skeleton` can print it without any runtime schema access.
+pub fn build_request_skeleton(doc: &OpenApiDoc, schema_name: &str) -> Result<String> {
+    let schema = doc
+        .components
+        .schemas
+        .get(schema_name)
+        .with_context(|| format!("request body schema `{schema_name}` not found"))?;
+    let mut seen = std::collections::HashSet::new();
+    seen.insert(schema_name.to_string());
+    let value = skeleton_value(doc, schema, &mut seen, 0);
+    serde_json::to_string_pretty(&value)
+        .with_context(|| format!("serializing skeleton for `{schema_name}`"))
+}
+
+/// A type-appropriate placeholder for one schema node. Mirrors AWS's skeleton
+/// convention: empty typed values (`""`, `0`, `false`), a single sample array
+/// element, nested objects recursed into. Enums use their first value (a
+/// valid example rather than an empty string the server would reject).
+fn skeleton_value(
+    doc: &OpenApiDoc,
+    schema: &RawSchema,
+    seen: &mut std::collections::HashSet<String>,
+    depth: usize,
+) -> serde_json::Value {
+    use serde_json::Value;
+    if depth > SKELETON_MAX_DEPTH {
+        return Value::Null;
+    }
+    // Resolve $ref, guarding against cycles.
+    if let Some(reference) = &schema.reference {
+        let name = reference.rsplit('/').next().unwrap_or(reference).to_string();
+        if seen.contains(&name) {
+            return Value::Null;
+        }
+        if let Some(resolved) = doc.components.schemas.get(&name) {
+            seen.insert(name.clone());
+            let v = skeleton_value(doc, resolved, seen, depth + 1);
+            seen.remove(&name);
+            return v;
+        }
+        return Value::Null;
+    }
+    // drf-spectacular wraps a single $ref (typically an enum) in allOf, and
+    // models nullable-enum / union fields as oneOf/anyOf whose first member
+    // is the "real" type (the rest are Blank/Null placeholders) -- take it.
+    for union in [&schema.all_of, &schema.one_of, &schema.any_of] {
+        if let Some(first) = union.as_ref().and_then(|list| list.first()) {
+            return skeleton_value(doc, first, seen, depth + 1);
+        }
+    }
+    if let Some(first) = schema.enum_values.as_ref().and_then(|v| v.first()) {
+        return Value::String(first.clone());
+    }
+    match schema.schema_type.as_deref() {
+        Some("string") => Value::String(String::new()),
+        Some("integer") | Some("number") => Value::from(0),
+        Some("boolean") => Value::Bool(false),
+        Some("array") => {
+            let elem = schema
+                .items
+                .as_ref()
+                .map(|items| skeleton_value(doc, items, seen, depth + 1));
+            Value::Array(elem.into_iter().collect())
+        }
+        Some("object") | None => match &schema.properties {
+            Some(props) => {
+                // serde_json::Map is BTreeMap-backed here, so keys land
+                // sorted -- deterministic across regenerations regardless of
+                // the source HashMap's iteration order.
+                let required: std::collections::HashSet<&str> = schema
+                    .required
+                    .as_deref()
+                    .unwrap_or(&[])
+                    .iter()
+                    .map(String::as_str)
+                    .collect();
+                let mut map = serde_json::Map::new();
+                for (name, prop) in props {
+                    if prop.read_only {
+                        continue;
+                    }
+                    // Required fields get a real typed placeholder; optional
+                    // ones are left `null`. Every optional field in these
+                    // request schemas is an `Option<T>` in rs-client, so a raw
+                    // skeleton deserializes cleanly (null -> None) and passes
+                    // the create/update `--request` type check as-is -- a
+                    // typed empty placeholder like "" would instead fail
+                    // against strict field types (dates, numbers). The user
+                    // fills in whichever optional fields they actually want.
+                    let value = if required.contains(name.as_str()) {
+                        skeleton_value(doc, prop, seen, depth + 1)
+                    } else {
+                        Value::Null
+                    };
+                    map.insert(name.clone(), value);
+                }
+                Value::Object(map)
+            }
+            None if schema.schema_type.as_deref() == Some("object") => {
+                Value::Object(serde_json::Map::new())
+            }
+            None => Value::Null,
+        },
+        _ => Value::Null,
+    }
 }

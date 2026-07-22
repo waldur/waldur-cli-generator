@@ -64,7 +64,22 @@ fn main() -> Result<()> {
         field_enum_values.insert(enum_name.clone(), values);
     }
 
-    let output = codegen::generate_all(&manifest, &operations, &field_enum_values)
+    // Build a fillable request-body template for every operation that has a
+    // request body, so codegen can embed it for `--generate-skeleton`. Keyed
+    // by the request type name, since the same type is reused across
+    // operations (e.g. a resource's create and update).
+    let mut request_skeletons: HashMap<String, String> = HashMap::new();
+    for op in operations.values() {
+        let Some(type_name) = &op.request_body_type else { continue };
+        if request_skeletons.contains_key(type_name) {
+            continue;
+        }
+        let skeleton = schema::build_request_skeleton(&doc, type_name)
+            .with_context(|| format!("building request skeleton for operation `{}`", op.operation_id))?;
+        request_skeletons.insert(type_name.clone(), skeleton);
+    }
+
+    let output = codegen::generate_all(&manifest, &operations, &field_enum_values, &request_skeletons)
         .context("generating CLI source")?;
 
     let commands_dir = waldur_cli_dir.join("src/commands");

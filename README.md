@@ -31,6 +31,11 @@ automatically; anything it doesn't recognize makes generation fail loudly for th
 rather than silently emit broken code -- extend `classify_param()` in `src/schema.rs` if you
 hit one you need to support.
 
+For `create`/`update`, the generator also walks the operation's request-body schema (resolving
+`$ref`/`allOf`/`oneOf`, enums, and nested objects) into a fillable JSON template, embedded in
+the generated command as a `const` for its `--generate-skeleton` flag -- required fields get a
+typed placeholder, optional ones default to `null` so the raw template is valid input.
+
 ## Regenerating locally
 
 ```bash
