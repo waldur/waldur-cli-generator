@@ -1,5 +1,12 @@
+include:
+  - project: "waldur/waldur-pipelines"
+    file: "/templates/utils/release-utils.yml"
+
 stages:
   - generate
+
+Fetch OpenAPI schema:
+  extends: .fetch-openapi-schema
 
 Generate CLI:
   stage: generate
@@ -8,6 +15,9 @@ Generate CLI:
     - if: '$CI_PIPELINE_SOURCE == "pipeline"'
     - if: '$CI_PIPELINE_SOURCE == "trigger"'
     - if: '$CI_PIPELINE_SOURCE == "web"'
+  needs:
+    - job: Fetch OpenAPI schema
+      artifacts: true
   cache:
     key: cargo
     paths:
@@ -25,11 +35,13 @@ Generate CLI:
     # "Upload OpenAPI schema..." job) -- CI_JOB_TOKEN's cross-project access
     # is scoped per-project and isn't reliably allow-listed, which is
     # exactly what broke .fetch-openapi-schema's internal-API path earlier.
-    - git clone --depth 1 "https://gitlab-ci-token:${GITLAB_TOKEN}@${CI_SERVER_HOST}/waldur/rs-client.git" ../rs-client
     - git clone "https://gitlab-ci-token:${GITLAB_TOKEN}@${CI_SERVER_HOST}/waldur/waldur-cli.git" ../waldur-cli
-    - cargo run --release -- ../rs-client ../waldur-cli
+    # waldur-openapi-schema.yaml is downloaded automatically from needs --
+    # the sole source of truth for command generation now, no rs-client
+    # checkout involved at all.
+    - cargo run --release -- waldur-openapi-schema.yaml ../waldur-cli
     - cd ../waldur-cli
     - |
       git add src/commands src/cli.rs
-      git diff --cached --quiet && echo "No changes" || git commit -m "chore: regenerate CLI command surface from rs-client"
+      git diff --cached --quiet && echo "No changes" || git commit -m "chore: regenerate CLI command surface from OpenAPI schema"
     - git push origin HEAD:main || echo "main already up to date in waldur-cli"

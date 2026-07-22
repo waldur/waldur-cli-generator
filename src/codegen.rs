@@ -1,5 +1,5 @@
-use crate::extract::{ExtractedMethod, ParamKind};
 use crate::manifest::{Manifest, Resource, KNOWN_VERBS};
+use crate::schema::{ExtractedOperation, ParamKind};
 use anyhow::{bail, Context, Result};
 use proc_macro2::TokenStream;
 use quote::{format_ident, quote};
@@ -22,127 +22,127 @@ fn snake_ident(kebab_or_snake: &str) -> proc_macro2::Ident {
     format_ident!("{}", kebab_or_snake.replace('-', "_"))
 }
 
+/// Builds a Rust identifier for a schema-supplied name, raw-escaping it
+/// (`r#type`) if it collides with a keyword (e.g. Waldur's `type` filter
+/// param) -- unlike an identifier, the wire-level query param name must stay
+/// the plain schema string, never raw-escaped.
+fn field_ident(name: &str) -> proc_macro2::Ident {
+    if syn::parse_str::<syn::Ident>(name).is_ok() {
+        format_ident!("{}", name)
+    } else {
+        format_ident!("r#{}", name)
+    }
+}
+
 struct FieldPlan {
     /// Empty for params that don't get a struct field (SkippedOptional).
     field_def: TokenStream,
-    call_expr: TokenStream,
-    /// Set for the first RequiredStr param (the uuid path param), used to
-    /// build a friendly delete confirmation message.
-    is_path_uuid: bool,
+    /// Empty for params that don't push a filter (SkippedOptional). Assumes
+    /// a `query_params: Vec<(String, String)>` local is in scope.
+    push_stmt: TokenStream,
 }
 
-/// Builds a `query_params.push((name, value))` statement for one filter arg,
-/// used by the `list` verb's auto-pagination path instead of a direct call
-/// (see `generate_resource_module`'s `is_list` branch). Returns `None` for
-/// `page`/`page_size` (the pagination helper manages those itself) and for
-/// kinds that can't sensibly be a query filter (JSON bodies, skipped params)
-/// -- list methods shouldn't have those, but silently omitting a filter is
-/// safer than failing generation over it.
-fn query_param_stmt(param: &crate::extract::ExtractedParam) -> Option<TokenStream> {
-    if param.name == "page" || param.name == "page_size" {
-        return None;
-    }
-    let ident = format_ident!("{}", param.name);
+fn plan_query_param(param: &crate::schema::ExtractedParam) -> Result<FieldPlan> {
+    let ident = field_ident(&param.name);
     let name = &param.name;
-    match &param.kind {
-        ParamKind::OptionalStr => Some(quote! {
-            if let Some(v) = &args.#ident {
-                query_params.push((#name.to_string(), v.clone()));
-            }
-        }),
-        ParamKind::OptionalBool => Some(quote! {
-            if let Some(v) = args.#ident {
-                query_params.push((#name.to_string(), v.to_string()));
-            }
-        }),
-        ParamKind::OptionalI64 => Some(quote! {
-            if let Some(v) = args.#ident {
-                query_params.push((#name.to_string(), v.to_string()));
-            }
-        }),
-        _ => None,
-    }
-}
-
-fn plan_param(param: &crate::extract::ExtractedParam) -> Result<FieldPlan> {
-    let ident = format_ident!("{}", param.name);
     Ok(match &param.kind {
         ParamKind::RequiredStr => FieldPlan {
-            field_def: quote! { pub #ident: String, },
-            call_expr: quote! { args.#ident.as_str() },
-            is_path_uuid: true,
+            field_def: quote! { #[arg(long)] pub #ident: String, },
+            push_stmt: quote! { query_params.push((#name.to_string(), args.#ident.clone())); },
         },
         ParamKind::OptionalStr => FieldPlan {
             field_def: quote! { #[arg(long)] pub #ident: Option<String>, },
-            call_expr: quote! { args.#ident.as_deref() },
-            is_path_uuid: false,
+            push_stmt: quote! {
+                if let Some(v) = &args.#ident {
+                    query_params.push((#name.to_string(), v.clone()));
+                }
+            },
         },
         ParamKind::RequiredBool => FieldPlan {
             field_def: quote! { #[arg(long)] pub #ident: bool, },
-            call_expr: quote! { args.#ident },
-            is_path_uuid: false,
+            push_stmt: quote! { query_params.push((#name.to_string(), args.#ident.to_string())); },
         },
         ParamKind::OptionalBool => FieldPlan {
             field_def: quote! { #[arg(long)] pub #ident: Option<bool>, },
-            call_expr: quote! { args.#ident },
-            is_path_uuid: false,
+            push_stmt: quote! {
+                if let Some(v) = args.#ident {
+                    query_params.push((#name.to_string(), v.to_string()));
+                }
+            },
         },
         ParamKind::RequiredI64 => FieldPlan {
-            field_def: quote! { pub #ident: i64, },
-            call_expr: quote! { args.#ident },
-            is_path_uuid: false,
+            field_def: quote! { #[arg(long)] pub #ident: i64, },
+            push_stmt: quote! { query_params.push((#name.to_string(), args.#ident.to_string())); },
         },
         ParamKind::OptionalI64 => FieldPlan {
             field_def: quote! { #[arg(long)] pub #ident: Option<i64>, },
-            call_expr: quote! { args.#ident },
-            is_path_uuid: false,
+            push_stmt: quote! {
+                if let Some(v) = args.#ident {
+                    query_params.push((#name.to_string(), v.to_string()));
+                }
+            },
         },
-        ParamKind::JsonBody(type_name) => {
-            let ty: syn::Type = syn::parse_str(&format!("waldur_client::{type_name}"))
-                .with_context(|| format!("invalid generated type name `{type_name}`"))?;
-            FieldPlan {
-                field_def: quote! { #[arg(long)] pub #ident: String, },
-                call_expr: quote! {
-                    serde_json::from_str::<#ty>(&args.#ident)
-                        .with_context(|| format!("--{} is not valid JSON for the expected request body", stringify!(#ident)))?
-                },
-                is_path_uuid: false,
-            }
-        }
-        ParamKind::OptionalJsonBody(type_name) => {
-            let ty: syn::Type = syn::parse_str(&format!("waldur_client::{type_name}"))
-                .with_context(|| format!("invalid generated type name `{type_name}`"))?;
-            FieldPlan {
-                field_def: quote! { #[arg(long)] pub #ident: Option<String>, },
-                call_expr: quote! {
-                    args.#ident.as_deref()
-                        .map(|s| serde_json::from_str::<#ty>(s))
-                        .transpose()
-                        .with_context(|| format!("--{} is not valid JSON for the expected request body", stringify!(#ident)))?
-                },
-                is_path_uuid: false,
-            }
-        }
         ParamKind::SkippedOptional => FieldPlan {
             field_def: quote! {},
-            call_expr: quote! { None },
-            is_path_uuid: false,
+            push_stmt: quote! {},
         },
         ParamKind::SkippedRequired => {
             bail!(
                 "parameter `{}` has a type this generator can't map to a CLI flag \
-                 (not a string/bool/i64/JSON-body shape) -- either extend classify_type() \
-                 in extract.rs, or drop this method from commands.toml",
+                 (not a string/bool/i64 shape) -- either extend classify_param() \
+                 in schema.rs, or drop this method from commands.toml",
                 param.name
             );
         }
     })
 }
 
+/// Maps the schema's HTTP verb for an operation to a `reqwest::Method`
+/// expression -- driven by the schema rather than the CLI verb name, so a
+/// resource that genuinely uses e.g. PATCH instead of PUT for `update`
+/// generates correctly instead of silently sending the wrong method.
+fn http_method_expr(op: &ExtractedOperation) -> Result<TokenStream> {
+    Ok(match op.http_verb.as_str() {
+        "get" => quote! { reqwest::Method::GET },
+        "post" => quote! { reqwest::Method::POST },
+        "put" => quote! { reqwest::Method::PUT },
+        "patch" => quote! { reqwest::Method::PATCH },
+        "delete" => quote! { reqwest::Method::DELETE },
+        other => bail!(
+            "operation `{}` uses HTTP verb `{other}`, which this generator doesn't know how to map",
+            op.operation_id
+        ),
+    })
+}
+
+/// Builds the expression for the request path at generation time, splitting
+/// the schema's literal path template (e.g. `/api/customers/{uuid}/`) around
+/// its path parameter, if it has one -- mirrors rs-client's own generated
+/// style rather than substituting at runtime.
+fn build_path_expr(op: &ExtractedOperation) -> Result<TokenStream> {
+    match &op.path_param {
+        Some(param_name) => {
+            let placeholder = format!("{{{param_name}}}");
+            let (prefix, suffix) = op.path.split_once(&placeholder).with_context(|| {
+                format!(
+                    "operation `{}`: path `{}` doesn't contain its own path param `{{{param_name}}}`",
+                    op.operation_id, op.path
+                )
+            })?;
+            let ident = field_ident(param_name);
+            Ok(quote! { format!("{}{}{}", #prefix, args.#ident, #suffix) })
+        }
+        None => {
+            let path = &op.path;
+            Ok(quote! { #path.to_string() })
+        }
+    }
+}
+
 /// One resource's generated file: Args structs + Command enum + run().
 fn generate_resource_module(
     resource: &Resource,
-    methods: &HashMap<String, ExtractedMethod>,
+    operations: &HashMap<String, ExtractedOperation>,
     field_enum_values: &HashMap<String, Vec<String>>,
 ) -> Result<TokenStream> {
     let resource_pascal = pascal_case(&resource.name);
@@ -151,46 +151,57 @@ fn generate_resource_module(
 
     let mut verb_variants = Vec::new();
     let mut verb_arms = Vec::new();
-    let mut uses_json_body = false;
+    let mut uses_context = false;
 
     for verb in KNOWN_VERBS {
         let Some(method_name) = resource.commands.get(*verb) else {
             continue;
         };
-        let method = methods.get(method_name).with_context(|| {
+        let op = operations.get(method_name).with_context(|| {
             format!(
-                "internal error: method `{method_name}` (resource `{}`, verb `{verb}`) \
+                "internal error: operation `{method_name}` (resource `{}`, verb `{verb}`) \
                  was not extracted",
                 resource.name
             )
         })?;
-        let method_ident = format_ident!("{}", method.name);
+
+        if *verb != "list" && !op.query_params.is_empty() {
+            bail!(
+                "resource `{}`, verb `{verb}` ({method_name}) has query parameter(s) \
+                 {:?} -- this generator only supports query filters on `list`, extend \
+                 codegen.rs if a non-list verb genuinely needs one",
+                resource.name,
+                op.query_params.iter().map(|p| &p.name).collect::<Vec<_>>()
+            );
+        }
 
         let mut field_defs = Vec::new();
-        let mut call_exprs = Vec::new();
-        let mut uuid_field: Option<proc_macro2::Ident> = None;
-        for param in &method.params {
-            if matches!(param.kind, ParamKind::JsonBody(_) | ParamKind::OptionalJsonBody(_)) {
-                uses_json_body = true;
-            }
-            let plan = plan_param(param)
-                .with_context(|| format!("in resource `{}`, verb `{verb}` ({method_name})", resource.name))?;
-            // `list` always auto-paginates now (see the `is_list` branch
-            // below), so page/page_size are no longer meaningful flags --
-            // dropping their field defs here keeps them out of --help
-            // instead of leaving silently-ignored dead flags behind.
-            let is_paging_field = *verb == "list" && (param.name == "page" || param.name == "page_size");
-            if !plan.field_def.is_empty() && !is_paging_field {
-                field_defs.push(plan.field_def);
-            }
-            call_exprs.push(plan.call_expr);
-            if plan.is_path_uuid && uuid_field.is_none() {
-                uuid_field = Some(format_ident!("{}", param.name));
+        let mut query_push_stmts = Vec::new();
+
+        if let Some(path_param) = &op.path_param {
+            let ident = field_ident(path_param);
+            field_defs.push(quote! { pub #ident: String, });
+        }
+        if *verb == "list" {
+            for param in &op.query_params {
+                let plan = plan_query_param(param)
+                    .with_context(|| format!("in resource `{}`, verb `{verb}` ({method_name})", resource.name))?;
+                if !plan.field_def.is_empty() {
+                    field_defs.push(plan.field_def);
+                }
+                if !plan.push_stmt.is_empty() {
+                    query_push_stmts.push(plan.push_stmt);
+                }
             }
         }
-        // Client-side only -- not one of rs-client's own method params (it
-        // doesn't have a "limit" concept), added here so `list` can bound a
-        // huge auto-paginated fetch instead of always fetching everything.
+        if *verb == "create" || *verb == "update" {
+            uses_context = true;
+            field_defs.push(quote! { #[arg(long)] pub request: String, });
+        }
+
+        // Client-side only -- not part of the schema (list has no "limit"
+        // concept), added here so `list` can bound a huge auto-paginated
+        // fetch instead of always fetching everything.
         if *verb == "list" {
             field_defs.push(quote! {
                 /// Stop after this many items (across however many pages that
@@ -208,7 +219,7 @@ fn generate_resource_module(
             // to returning the complete object with no error at all. Validate
             // against the resource's own FieldEnum values client-side instead
             // of letting that happen silently, when we know what they are.
-            let valid_values = method.field_enum_name.as_ref().and_then(|name| field_enum_values.get(name));
+            let valid_values = op.field_enum_name.as_ref().and_then(|name| field_enum_values.get(name));
             field_defs.push(match valid_values {
                 Some(values) => quote! {
                     #[doc = #doc]
@@ -237,22 +248,13 @@ fn generate_resource_module(
             #variant_ident(#args_ident),
         });
 
-        let call = quote! { client.#method_ident(#(#call_exprs),*).await? };
+        let path_expr = build_path_expr(op)?;
 
         let output_stmt = if *verb == "list" {
-            let list_path = method.list_path.as_deref().with_context(|| {
-                format!(
-                    "resource `{}`, verb `list` ({method_name}): couldn't find this method's \
-                     REST path (expected a \"/api/...\" literal in its body) -- needed to \
-                     auto-paginate",
-                    resource.name
-                )
-            })?;
-            let query_param_stmts: Vec<TokenStream> =
-                method.params.iter().filter_map(query_param_stmt).collect();
+            let path = &op.path;
             quote! {
                 let mut query_params: Vec<(String, String)> = Vec::new();
-                #(#query_param_stmts)*
+                #(#query_push_stmts)*
                 // Table always narrows the server fetch to its own display
                 // columns (there's never a reason to fetch more than what
                 // it shows); json/toon/tsv fetch the complete object by
@@ -271,7 +273,7 @@ fn generate_resource_module(
                         }
                     }
                 }
-                let result = crate::pagination::fetch_all(base_url, token, #list_path, &query_params, args.limit).await?;
+                let result = crate::pagination::fetch_all(base_url, token, #path, &query_params, args.limit).await?;
                 // table/tsv render exactly these columns (json/toon ignore
                 // them, showing the complete fetched object regardless) --
                 // when --fields narrowed what was actually fetched, the
@@ -285,10 +287,42 @@ fn generate_resource_module(
                 };
                 crate::output::print_result(&result, &display_columns, format)?;
             }
-        } else if *verb == "delete" {
-            let uuid_ident = uuid_field.unwrap_or_else(|| format_ident!("uuid"));
+        } else if *verb == "get" {
+            let method_expr = http_method_expr(op)?;
             quote! {
-                let _ = #call;
+                let path = #path_expr;
+                let result = crate::http::call_one(base_url, token, #method_expr, &path, None).await?;
+                crate::output::print_result(&result, COLUMNS, format)?;
+            }
+        } else if *verb == "create" || *verb == "update" {
+            let request_ty_name = op.request_body_type.as_deref().with_context(|| {
+                format!(
+                    "resource `{}`, verb `{verb}` ({method_name}): couldn't find this \
+                     operation's request body schema -- needed to validate --request",
+                    resource.name
+                )
+            })?;
+            let request_ty: syn::Type = syn::parse_str(&format!("waldur_client::{request_ty_name}"))
+                .with_context(|| format!("invalid generated type name `{request_ty_name}`"))?;
+            let method_expr = http_method_expr(op)?;
+            quote! {
+                serde_json::from_str::<#request_ty>(&args.request)
+                    .with_context(|| format!("--{} is not valid JSON for the expected request body", stringify!(request)))?;
+                let path = #path_expr;
+                let result = crate::http::call_one(base_url, token, #method_expr, &path, Some(&args.request)).await?;
+                crate::output::print_result(&result, COLUMNS, format)?;
+            }
+        } else {
+            // delete
+            let method_expr = http_method_expr(op)?;
+            let uuid_ident = op
+                .path_param
+                .as_ref()
+                .map(|p| field_ident(p))
+                .unwrap_or_else(|| format_ident!("uuid"));
+            quote! {
+                let path = #path_expr;
+                let _ = crate::http::call_one(base_url, token, #method_expr, &path, None).await?;
                 match format {
                     crate::output::OutputFormat::Json => {
                         println!("{}", serde_json::json!({"deleted": true, "uuid": args.#uuid_ident}));
@@ -308,11 +342,6 @@ fn generate_resource_module(
                         );
                     }
                 }
-            }
-        } else {
-            quote! {
-                let result = #call;
-                crate::output::print_result(&result, COLUMNS, format)?;
             }
         };
 
@@ -341,7 +370,7 @@ fn generate_resource_module(
 
     let about = &resource.about;
     let columns_len = columns.len();
-    let context_import = if uses_json_body {
+    let context_import = if uses_context {
         quote! { use anyhow::Context; }
     } else {
         quote! {}
@@ -353,7 +382,6 @@ fn generate_resource_module(
         #![allow(clippy::too_many_arguments)]
 
         #context_import
-        use waldur_client::HttpClient;
 
         const COLUMNS: &[&str; #columns_len] = &[#(#columns),*];
 
@@ -366,7 +394,7 @@ fn generate_resource_module(
         #(#args_structs)*
 
         pub async fn run(
-            client: &HttpClient,
+            _client: &waldur_client::HttpClient,
             base_url: &str,
             token: Option<&str>,
             command: #resource_enum_ident,
@@ -404,7 +432,7 @@ pub struct GeneratedOutput {
 
 pub fn generate_all(
     manifest: &Manifest,
-    methods: &HashMap<String, ExtractedMethod>,
+    operations: &HashMap<String, ExtractedOperation>,
     field_enum_values: &HashMap<String, Vec<String>>,
 ) -> Result<GeneratedOutput> {
     let mut resources = Vec::new();
@@ -413,7 +441,7 @@ pub fn generate_all(
     for group in &manifest.group {
         let mut resource_mod_decls = Vec::new();
         for resource in &group.resource {
-            let tokens = generate_resource_module(resource, methods, field_enum_values)
+            let tokens = generate_resource_module(resource, operations, field_enum_values)
                 .with_context(|| format!("generating group `{}` resource `{}`", group.name, resource.name))?;
             let file: syn::File = syn::parse2(tokens.clone()).with_context(|| {
                 format!(

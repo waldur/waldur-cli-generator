@@ -1,22 +1,24 @@
 mod codegen;
-mod extract;
 mod manifest;
+mod schema;
 
 use anyhow::{Context, Result};
 use std::collections::{BTreeSet, HashMap};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-/// Usage: waldur-cli-generator [RS_CLIENT_DIR] [WALDUR_CLI_DIR]
+/// Usage: waldur-cli-generator [SCHEMA_PATH] [WALDUR_CLI_DIR]
 ///
-/// Defaults assume the conventional CI layout where rs-client and waldur-cli
-/// are checked out as sibling directories of this repo.
+/// `SCHEMA_PATH` is the OpenAPI schema (YAML) to generate commands from --
+/// the sole source of truth for every operation's path, params, and
+/// request/response shape. `WALDUR_CLI_DIR` defaults to the conventional CI
+/// layout where waldur-cli is checked out as a sibling of this repo.
 fn main() -> Result<()> {
     let mut args = std::env::args().skip(1);
-    let rs_client_dir = args
+    let schema_path = args
         .next()
         .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("../rs-client"));
+        .unwrap_or_else(|| PathBuf::from("waldur-openapi-schema.yaml"));
     let waldur_cli_dir = args
         .next()
         .map(PathBuf::from)
@@ -28,9 +30,7 @@ fn main() -> Result<()> {
     let manifest: manifest::Manifest =
         toml::from_str(&manifest_text).context("parsing commands.toml")?;
 
-    let client_rs_path = rs_client_dir.join("src/generated/client.rs");
-    let client_source = fs::read_to_string(&client_rs_path)
-        .with_context(|| format!("reading {} (pass the rs-client checkout path as the first argument if it's not at ../rs-client)", client_rs_path.display()))?;
+    let doc = schema::load(&schema_path)?;
 
     let wanted: Vec<String> = manifest
         .group
@@ -42,29 +42,29 @@ fn main() -> Result<()> {
         .into_iter()
         .collect();
 
-    let methods = extract::extract_methods(&client_source, &wanted)
-        .context("extracting method signatures from rs-client")?;
+    let mut operations: HashMap<String, schema::ExtractedOperation> = HashMap::new();
+    for operation_id in &wanted {
+        let op = schema::extract_operation(&doc, operation_id)
+            .with_context(|| format!("extracting operation `{operation_id}` from OpenAPI schema"))?;
+        operations.insert(operation_id.clone(), op);
+    }
 
-    let types_rs_path = rs_client_dir.join("src/generated/types.rs");
-    let types_source = fs::read_to_string(&types_rs_path)
-        .with_context(|| format!("reading {}", types_rs_path.display()))?;
-
-    // Resolve valid --fields values for every list method that has a
-    // `field: Option<Vec<XxxFieldEnum>>` param, so codegen can validate
-    // --fields client-side instead of silently sending a bad name the
-    // server will just as silently ignore.
+    // Resolve valid --fields values for every list operation that has a
+    // `field` query param, so codegen can validate --fields client-side
+    // instead of silently sending a bad name the server will just as
+    // silently ignore.
     let mut field_enum_values: HashMap<String, Vec<String>> = HashMap::new();
-    for method in methods.values() {
-        let Some(enum_name) = &method.field_enum_name else { continue };
+    for op in operations.values() {
+        let Some(enum_name) = &op.field_enum_name else { continue };
         if field_enum_values.contains_key(enum_name) {
             continue;
         }
-        let values = extract::extract_enum_values(&types_source, enum_name)
-            .with_context(|| format!("resolving --fields values for method `{}`", method.name))?;
+        let values = schema::extract_enum_values(&doc, enum_name)
+            .with_context(|| format!("resolving --fields values for operation `{}`", op.operation_id))?;
         field_enum_values.insert(enum_name.clone(), values);
     }
 
-    let output = codegen::generate_all(&manifest, &methods, &field_enum_values)
+    let output = codegen::generate_all(&manifest, &operations, &field_enum_values)
         .context("generating CLI source")?;
 
     let commands_dir = waldur_cli_dir.join("src/commands");
@@ -91,10 +91,10 @@ fn main() -> Result<()> {
     println!("wrote {}", cli_path.display());
 
     println!(
-        "Generated {} resource(s) across {} group(s), {} rs-client method(s) used.",
+        "Generated {} resource(s) across {} group(s), {} operation(s) used.",
         output.resources.len(),
         manifest.group.len(),
-        methods.len()
+        operations.len()
     );
 
     Ok(())
