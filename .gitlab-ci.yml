@@ -3,6 +3,7 @@ include:
     file: "/templates/utils/release-utils.yml"
 
 stages:
+  - test
   - generate
 
 Fetch OpenAPI schema:
