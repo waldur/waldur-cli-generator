@@ -34,61 +34,20 @@ fn field_ident(name: &str) -> proc_macro2::Ident {
     }
 }
 
-struct FieldPlan {
-    /// Empty for params that don't get a struct field (SkippedOptional).
-    field_def: TokenStream,
-    /// Empty for params that don't push a filter (SkippedOptional). Assumes
-    /// a `query_params: Vec<(String, String)>` local is in scope.
-    push_stmt: TokenStream,
-}
-
-fn plan_query_param(param: &crate::schema::ExtractedParam) -> Result<FieldPlan> {
-    let ident = field_ident(&param.name);
-    let name = &param.name;
+/// Maps a query param's schema-derived kind to a `crate::filter::FilterKind`
+/// expression for the resource's `FILTER_SPEC`, so `--filter key=value` can
+/// validate the value's type client-side. `None` for params that can't be
+/// exposed as a filter at all (an unrecognized required shape is still a
+/// hard failure -- generation can't silently drop a required filter).
+fn filter_kind_expr(param: &crate::schema::ExtractedParam) -> Result<Option<TokenStream>> {
     Ok(match &param.kind {
-        ParamKind::RequiredStr => FieldPlan {
-            field_def: quote! { #[arg(long)] pub #ident: String, },
-            push_stmt: quote! { query_params.push((#name.to_string(), args.#ident.clone())); },
-        },
-        ParamKind::OptionalStr => FieldPlan {
-            field_def: quote! { #[arg(long)] pub #ident: Option<String>, },
-            push_stmt: quote! {
-                if let Some(v) = &args.#ident {
-                    query_params.push((#name.to_string(), v.clone()));
-                }
-            },
-        },
-        ParamKind::RequiredBool => FieldPlan {
-            field_def: quote! { #[arg(long)] pub #ident: bool, },
-            push_stmt: quote! { query_params.push((#name.to_string(), args.#ident.to_string())); },
-        },
-        ParamKind::OptionalBool => FieldPlan {
-            field_def: quote! { #[arg(long)] pub #ident: Option<bool>, },
-            push_stmt: quote! {
-                if let Some(v) = args.#ident {
-                    query_params.push((#name.to_string(), v.to_string()));
-                }
-            },
-        },
-        ParamKind::RequiredI64 => FieldPlan {
-            field_def: quote! { #[arg(long)] pub #ident: i64, },
-            push_stmt: quote! { query_params.push((#name.to_string(), args.#ident.to_string())); },
-        },
-        ParamKind::OptionalI64 => FieldPlan {
-            field_def: quote! { #[arg(long)] pub #ident: Option<i64>, },
-            push_stmt: quote! {
-                if let Some(v) = args.#ident {
-                    query_params.push((#name.to_string(), v.to_string()));
-                }
-            },
-        },
-        ParamKind::SkippedOptional => FieldPlan {
-            field_def: quote! {},
-            push_stmt: quote! {},
-        },
+        ParamKind::RequiredStr | ParamKind::OptionalStr => Some(quote! { crate::filter::FilterKind::Str }),
+        ParamKind::RequiredBool | ParamKind::OptionalBool => Some(quote! { crate::filter::FilterKind::Bool }),
+        ParamKind::RequiredI64 | ParamKind::OptionalI64 => Some(quote! { crate::filter::FilterKind::I64 }),
+        ParamKind::SkippedOptional => None,
         ParamKind::SkippedRequired => {
             bail!(
-                "parameter `{}` has a type this generator can't map to a CLI flag \
+                "parameter `{}` has a type this generator can't map to a --filter value \
                  (not a string/bool/i64 shape) -- either extend classify_param() \
                  in schema.rs, or drop this method from commands.toml",
                 param.name
@@ -181,6 +140,7 @@ fn generate_resource_module(
     let mut verb_variants = Vec::new();
     let mut verb_arms = Vec::new();
     let mut skeleton_consts = Vec::new();
+    let mut filter_spec_consts = Vec::new();
     let mut uses_context = false;
 
     for verb in KNOWN_VERBS {
@@ -206,7 +166,6 @@ fn generate_resource_module(
         }
 
         let mut field_defs = Vec::new();
-        let mut query_push_stmts = Vec::new();
         // Struct-level attribute (e.g. the request-body arg group on
         // create/update); empty for verbs that don't need one.
         let mut struct_attr = quote! {};
@@ -227,16 +186,55 @@ fn generate_resource_module(
             }
         }
         if *verb == "list" {
-            for param in &op.query_params {
-                let plan = plan_query_param(param)
-                    .with_context(|| format!("in resource `{}`, verb `{verb}` ({method_name})", resource.name))?;
-                if !plan.field_def.is_empty() {
-                    field_defs.push(plan.field_def);
-                }
-                if !plan.push_stmt.is_empty() {
-                    query_push_stmts.push(plan.push_stmt);
-                }
-            }
+            // Every real query filter goes through one generic --filter
+            // KEY=VALUE flag (AWS --filters / kubectl --field-selector
+            // style) instead of a dedicated flag per field -- some resources
+            // have 20+ filterable fields, and a single uniform pattern is
+            // both a smaller --help and one thing to learn across every
+            // resource (mirrors --request's own move away from a flag per
+            // request-body field). FILTER_SPEC (built from the same
+            // op.query_params used before) is what makes this still
+            // client-side-validated rather than a blind passthrough: a
+            // bad key or wrongly-typed value is rejected locally.
+            let spec_entries: Vec<TokenStream> = op
+                .query_params
+                .iter()
+                .map(|param| {
+                    let name = &param.name;
+                    filter_kind_expr(param)
+                        .with_context(|| format!("in resource `{}`, verb `{verb}` ({method_name})", resource.name))
+                        .map(|kind| kind.map(|k| quote! { (#name, #k) }))
+                })
+                .collect::<Result<Vec<_>>>()?
+                .into_iter()
+                .flatten()
+                .collect();
+            filter_spec_consts.push(quote! {
+                const FILTER_SPEC: &[(&str, crate::filter::FilterKind)] = &[#(#spec_entries),*];
+            });
+            field_defs.push(quote! {
+                /// Filter results server-side, KEY=VALUE (repeatable). See
+                /// --help's error on an unknown key for the valid keys.
+                #[arg(long = "filter", value_name = "KEY=VALUE")]
+                pub filter: Vec<String>,
+            });
+            // Named jmespath, not query: several resources have a real
+            // `query` filter field of their own (e.g. customers' full-text
+            // search) -- `--filter query=...` reaches that. A `--query` flag
+            // here would silently shadow it (a bare word is itself valid
+            // JMESPath, a field projection, so `--query foo` wouldn't even
+            // error, just silently do something other than what a user
+            // migrating from `--query` on other CLIs would expect).
+            field_defs.push(quote! {
+                /// Reshape/narrow the already-fetched result with a JMESPath
+                /// expression (https://jmespath.org), client-side -- e.g.
+                /// [].name or [?blocked==`true`]. Applied after fetching,
+                /// before rendering in --format. (Named distinctly from
+                /// --filter's own `query` key, several resources' own
+                /// full-text search field.)
+                #[arg(long)]
+                pub jmespath: Option<String>,
+            });
         }
         if *verb == "create" || *verb == "update" {
             uses_context = true;
@@ -339,8 +337,7 @@ fn generate_resource_module(
         let output_stmt = if *verb == "list" {
             let path = &op.path;
             quote! {
-                let mut query_params: Vec<(String, String)> = Vec::new();
-                #(#query_push_stmts)*
+                let mut query_params: Vec<(String, String)> = crate::filter::parse_filters(&args.filter, FILTER_SPEC)?;
                 // Table always narrows the server fetch to its own display
                 // columns (there's never a reason to fetch more than what
                 // it shows); json/toon/tsv fetch the complete object by
@@ -370,6 +367,14 @@ fn generate_resource_module(
                 let display_columns: Vec<&str> = match &args.fields {
                     Some(fields) => fields.iter().map(String::as_str).collect(),
                     None => COLUMNS.to_vec(),
+                };
+                // --query reshapes the already-fetched result client-side
+                // (AWS CLI's --query) -- distinct from --filter, which
+                // narrows what's fetched in the first place.
+                let result: serde_json::Value = serde_json::Value::Array(result);
+                let result = match &args.jmespath {
+                    Some(expr) => crate::query::apply(result, expr)?,
+                    None => result,
                 };
                 crate::output::print_result(&result, &display_columns, format)?;
             }
@@ -478,6 +483,8 @@ fn generate_resource_module(
         #context_import
 
         const COLUMNS: &[&str; #columns_len] = &[#(#columns),*];
+
+        #(#filter_spec_consts)*
 
         #(#skeleton_consts)*
 

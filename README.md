@@ -25,11 +25,13 @@ operations. See the comment at the top of that file for what's excluded and why 
 OpenStack tenant/instance/volume creation goes through Waldur's marketplace ordering flow).
 
 To add a resource or verb: add a `commands.*` entry to `commands.toml` referencing the exact
-`operationId` from the OpenAPI schema, then regenerate. The generator classifies each
-operation's real query parameters (string/bool/i64, required or optional) into a CLI flag
-automatically; anything it doesn't recognize makes generation fail loudly for that operation
-rather than silently emit broken code -- extend `classify_param()` in `src/schema.rs` if you
-hit one you need to support.
+`operationId` from the OpenAPI schema, then regenerate. `list`'s query parameters don't get a
+dedicated flag each (some resources have 20+) -- the generator classifies each one's real type
+(string/bool/i64) and emits a `FILTER_SPEC` const from it, which the generated command's single
+`--filter KEY=VALUE` flag (`waldur-cli`'s hand-written `src/filter.rs`) validates against at
+runtime. A query parameter type this generator doesn't recognize makes generation fail loudly
+for that operation rather than silently emit broken code -- extend `classify_param()` in
+`src/schema.rs` if you hit one you need to support.
 
 For `create`/`update`, the generator also walks the operation's request-body schema (resolving
 `$ref`/`allOf`/`oneOf`, enums, and nested objects) into a fillable JSON template, embedded in
