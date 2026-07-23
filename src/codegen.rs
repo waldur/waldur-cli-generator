@@ -138,6 +138,23 @@ fn generate_resource_module(
     let resource_enum_ident = format_ident!("{}Command", resource_pascal);
     let columns = &resource.columns;
 
+    // Whether the ambient `--project` scope applies to this resource: its
+    // `list` supports a `project_uuid` filter, or it can be provisioned (every
+    // marketplace order needs a project). Drives whether `run` uses the
+    // `project` argument or takes it as `_project`.
+    let list_has_project = resource
+        .commands
+        .get("list")
+        .and_then(|m| operations.get(m))
+        .map(|op| op.query_params.iter().any(|p| p.name == "project_uuid"))
+        .unwrap_or(false);
+    let uses_project = list_has_project || resource.order.is_some();
+    let project_param = if uses_project {
+        quote! { project }
+    } else {
+        quote! { _project }
+    };
+
     let mut verb_variants = Vec::new();
     let mut verb_arms = Vec::new();
     let mut skeleton_consts = Vec::new();
@@ -337,8 +354,23 @@ fn generate_resource_module(
 
         let output_stmt = if *verb == "list" {
             let path = &op.path;
+            // Apply the ambient --project scope, unless the user already
+            // filtered by project_uuid explicitly (theirs wins). Only for
+            // resources whose list actually supports the filter.
+            let project_inject = if list_has_project {
+                quote! {
+                    if let Some(project) = project {
+                        if !query_params.iter().any(|(k, _)| k == "project_uuid") {
+                            query_params.push(("project_uuid".to_string(), project.to_string()));
+                        }
+                    }
+                }
+            } else {
+                quote! {}
+            };
             quote! {
                 let mut query_params: Vec<(String, String)> = crate::filter::parse_filters(&args.filter, FILTER_SPEC)?;
+                #project_inject
                 // Table always narrows the server fetch to its own display
                 // columns (there's never a reason to fetch more than what
                 // it shows); json/toon/tsv fetch the complete object by
@@ -492,7 +524,7 @@ fn generate_resource_module(
                     return Ok(());
                 }
                 let body = crate::request::load_body(args.request.as_deref(), args.request_file.as_deref())?;
-                crate::order::provision(base_url, token, &body, !args.no_wait, args.timeout, format).await?;
+                crate::order::provision(base_url, token, &body, project, !args.no_wait, args.timeout, format).await?;
             }
             #resource_enum_ident::Terminate(args) => {
                 crate::order::terminate(base_url, token, &args.uuid, args.request.as_deref(), !args.no_wait, args.timeout, format).await?;
@@ -592,6 +624,7 @@ fn generate_resource_module(
             _client: &waldur_client::HttpClient,
             base_url: &str,
             token: Option<&str>,
+            #project_param: Option<&str>,
             command: #resource_enum_ident,
             format: crate::output::OutputFormat,
         ) -> anyhow::Result<()> {
@@ -703,7 +736,7 @@ fn generate_cli_file(manifest: &Manifest) -> Result<String> {
             });
             resource_arms.push(quote! {
                 #group_enum_ident::#resource_variant_ident(cmd) => {
-                    crate::commands::#group_mod::#resource_mod::run(client, base_url, token, cmd, format).await
+                    crate::commands::#group_mod::#resource_mod::run(client, base_url, token, project, cmd, format).await
                 }
             });
         }
@@ -753,6 +786,7 @@ fn generate_cli_file(manifest: &Manifest) -> Result<String> {
             client: &waldur_client::HttpClient,
             base_url: &str,
             token: Option<&str>,
+            project: Option<&str>,
             command: GroupCommand,
             format: crate::output::OutputFormat,
         ) -> anyhow::Result<()> {
