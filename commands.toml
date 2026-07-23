@@ -1,23 +1,19 @@
 # Command manifest for waldur-cli-generator.
 #
 # Single source of truth for what waldur-cli's command surface covers. Each
-# `commands.*` value must be the exact name of a `pub async fn` on rs-client's
-# `HttpClient` (see ~/waldur/rs-client/src/generated/client.rs) -- the
-# generator parses that method's real signature with `syn` rather than
-# trusting anything declared here about its shape.
+# `commands.*` value must be the exact `operationId` from Waldur's OpenAPI
+# schema -- the generator parses that operation's real path/params/request
+# shape from the schema directly (see src/schema.rs).
 #
-# Deliberately not 1:1 with rs-client's ~451 operations: only list/get/create/
-# update/delete are covered, and only where rs-client actually exposes a
-# direct REST operation for it. OpenStack tenant/instance/volume creation and
-# deletion happen through Waldur's marketplace ordering flow, which is outside
-# rs-client's generated surface (rs-client is itself scoped to OpenStack +
-# team-management tags, excluding marketplace-orders) -- so those three
-# resources are read/update only here. Action-style operations (start/stop/
-# attach/approve/...) aren't covered by this generator yet; add a `commands.*`
-# key and extend the generator's Verb enum to support one when needed.
+# Deliberately not 1:1 with Waldur's ~451 operations: only list/get/create/
+# update/delete are covered as direct REST verbs. OpenStack tenant/instance/
+# volume creation and deletion happen through Waldur's marketplace ordering
+# flow instead -- those resources declare a `[group.resource.order]` block
+# (offering_type) and get `provision`/`terminate` subcommands generated for
+# that async order workflow rather than a direct REST create/delete. Other
+# action-style operations (start/stop/attach/approve/...) aren't covered yet.
 #
-# `columns` lists the fields shown in the default human-readable table,
-# verified against the real generated struct fields in types.rs.
+# `columns` lists the fields shown in the default human-readable table.
 
 [[group]]
 name = "openstack"
@@ -31,6 +27,8 @@ about = "Manage OpenStack resources"
     list = "openstack_tenants_list"
     get = "openstack_tenants_retrieve"
     update = "openstack_tenants_update"
+    [group.resource.order]
+    offering_type = "OpenStack.Tenant"
 
   [[group.resource]]
   name = "instance"
@@ -40,6 +38,8 @@ about = "Manage OpenStack resources"
     list = "openstack_instances_list"
     get = "openstack_instances_retrieve"
     update = "openstack_instances_update"
+    [group.resource.order]
+    offering_type = "OpenStack.Instance"
 
   [[group.resource]]
   name = "volume"
@@ -49,6 +49,8 @@ about = "Manage OpenStack resources"
     list = "openstack_volumes_list"
     get = "openstack_volumes_retrieve"
     update = "openstack_volumes_update"
+    [group.resource.order]
+    offering_type = "OpenStack.Volume"
 
   [[group.resource]]
   name = "network"
@@ -182,3 +184,15 @@ about = "Manage team membership and organization access"
     [group.resource.commands]
     list = "user_permission_requests_list"
     get = "user_permission_requests_retrieve"
+
+[[group]]
+name = "marketplace"
+about = "Browse marketplace offerings (for provisioning via `openstack ... provision`)"
+
+  [[group.resource]]
+  name = "offering"
+  about = "Marketplace offerings (public)"
+  columns = ["uuid", "name", "type", "state"]
+    [group.resource.commands]
+    list = "marketplace_public_offerings_list"
+    get = "marketplace_public_offerings_retrieve"

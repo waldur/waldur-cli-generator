@@ -38,6 +38,13 @@ For `create`/`update`, the generator also walks the operation's request-body sch
 the generated command as a `const` for its `--generate-skeleton` flag -- required fields get a
 typed placeholder, optional ones default to `null` so the raw template is valid input.
 
+A resource can also declare a `[group.resource.order]` block with an `offering_type` (e.g.
+`OpenStack.Instance`). That resource gets `provision`/`terminate` subcommands for Waldur's
+async marketplace-order flow instead of a direct REST create/delete. `provision`'s
+`--generate-skeleton` is the `OrderCreateRequest` envelope with the typed
+`{OfferingType}CreateOrderAttributes` schema spliced into its free-form `attributes` slot;
+the runtime polling lives in waldur-cli's hand-written `src/order.rs`.
+
 ## Regenerating locally
 
 ```bash

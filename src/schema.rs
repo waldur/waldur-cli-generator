@@ -172,6 +172,18 @@ fn classify_param(param: &RawParameter) -> ParamKind {
                 ParamKind::OptionalI64
             }
         }
+        // An array query param (e.g. offerings' `type`, `state`) is filtered
+        // on the wire by repeating the key: `?type=A&type=B`. `--filter` is
+        // already repeatable and pushes one query param per occurrence, so
+        // exposing these as a plain string filter (`--filter type=A --filter
+        // type=B`) maps exactly onto that -- no special array handling needed.
+        Some("array") => {
+            if required {
+                ParamKind::RequiredStr
+            } else {
+                ParamKind::OptionalStr
+            }
+        }
         _ => {
             if required {
                 ParamKind::SkippedRequired
@@ -302,16 +314,46 @@ const SKELETON_MAX_DEPTH: usize = 12;
 /// placeholder, as pretty-printed JSON. Emitted into the generated command
 /// so `--generate-skeleton` can print it without any runtime schema access.
 pub fn build_request_skeleton(doc: &OpenApiDoc, schema_name: &str) -> Result<String> {
+    let value = skeleton_for(doc, schema_name)?;
+    serde_json::to_string_pretty(&value)
+        .with_context(|| format!("serializing skeleton for `{schema_name}`"))
+}
+
+/// The skeleton for a named schema as a `serde_json::Value` (rather than a
+/// pretty string) -- lets callers compose skeletons, e.g. splice a resource's
+/// typed attributes into the free-form `attributes` slot of an order body.
+fn skeleton_for(doc: &OpenApiDoc, schema_name: &str) -> Result<serde_json::Value> {
     let schema = doc
         .components
         .schemas
         .get(schema_name)
-        .with_context(|| format!("request body schema `{schema_name}` not found"))?;
+        .with_context(|| format!("schema `{schema_name}` not found"))?;
     let mut seen = std::collections::HashSet::new();
     seen.insert(schema_name.to_string());
-    let value = skeleton_value(doc, schema, &mut seen, 0);
-    serde_json::to_string_pretty(&value)
-        .with_context(|| format!("serializing skeleton for `{schema_name}`"))
+    Ok(skeleton_value(doc, schema, &mut seen, 0))
+}
+
+/// Builds the `--generate-skeleton` template for a `provision` command: the
+/// marketplace `OrderCreateRequest` envelope, but with its free-form
+/// `attributes` object replaced by the typed skeleton for this offering's
+/// `{OfferingType}CreateOrderAttributes` schema (Waldur's naming convention,
+/// e.g. `OpenStack.Instance` -> `OpenStackInstanceCreateOrderAttributes`).
+/// `accepting_terms_of_service` is defaulted to `true` -- a CLI provision is
+/// an explicit action, and leaving it unset can leave the order stuck pending
+/// consumer approval.
+pub fn build_order_skeleton(doc: &OpenApiDoc, offering_type: &str) -> Result<String> {
+    let mut envelope = skeleton_for(doc, "OrderCreateRequest")?;
+    let attrs_schema = format!("{}CreateOrderAttributes", offering_type.replace('.', ""));
+    let attributes = skeleton_for(doc, &attrs_schema).with_context(|| {
+        format!("no attributes schema `{attrs_schema}` for offering type `{offering_type}`")
+    })?;
+    let obj = envelope
+        .as_object_mut()
+        .context("OrderCreateRequest skeleton is not a JSON object")?;
+    obj.insert("attributes".to_string(), attributes);
+    obj.insert("accepting_terms_of_service".to_string(), serde_json::Value::Bool(true));
+    serde_json::to_string_pretty(&envelope)
+        .with_context(|| format!("serializing order skeleton for `{offering_type}`"))
 }
 
 /// A type-appropriate placeholder for one schema node. Mirrors AWS's skeleton

@@ -79,8 +79,27 @@ fn main() -> Result<()> {
         request_skeletons.insert(type_name.clone(), skeleton);
     }
 
-    let output = codegen::generate_all(&manifest, &operations, &field_enum_values, &request_skeletons)
-        .context("generating CLI source")?;
+    // Build a `provision` (marketplace order) skeleton for every resource
+    // that declares an order config, keyed by offering_type.
+    let mut order_skeletons: HashMap<String, String> = HashMap::new();
+    for resource in manifest.group.iter().flat_map(|g| &g.resource) {
+        let Some(order) = &resource.order else { continue };
+        if order_skeletons.contains_key(&order.offering_type) {
+            continue;
+        }
+        let skeleton = schema::build_order_skeleton(&doc, &order.offering_type)
+            .with_context(|| format!("building order skeleton for resource `{}`", resource.name))?;
+        order_skeletons.insert(order.offering_type.clone(), skeleton);
+    }
+
+    let output = codegen::generate_all(
+        &manifest,
+        &operations,
+        &field_enum_values,
+        &request_skeletons,
+        &order_skeletons,
+    )
+    .context("generating CLI source")?;
 
     let commands_dir = waldur_cli_dir.join("src/commands");
     fs::create_dir_all(&commands_dir)
