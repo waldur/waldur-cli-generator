@@ -1,6 +1,7 @@
 mod codegen;
 mod manifest;
 mod schema;
+mod schema_codegen;
 
 use anyhow::{Context, Result};
 use std::collections::{BTreeSet, HashMap};
@@ -121,6 +122,29 @@ fn main() -> Result<()> {
     let cli_path = waldur_cli_dir.join("src/cli.rs");
     fs::write(&cli_path, &output.cli_source).with_context(|| format!("writing {}", cli_path.display()))?;
     println!("wrote {}", cli_path.display());
+
+    // Generate the CLI schema JSON and emit it as src/schema.rs.
+    let cli_version = {
+        let cargo_toml_path = waldur_cli_dir.join("Cargo.toml");
+        let cargo_text = fs::read_to_string(&cargo_toml_path)
+            .with_context(|| format!("reading {} to extract CLI version", cargo_toml_path.display()))?;
+        let cargo_toml: toml::Value = cargo_text.parse().context("parsing waldur-cli Cargo.toml")?;
+        cargo_toml["package"]["version"]
+            .as_str()
+            .unwrap_or("0.0.0")
+            .to_string()
+    };
+    let schema_json = schema_codegen::build_schema_json(
+        &manifest,
+        &operations,
+        &field_enum_values,
+        &request_skeletons,
+        &order_skeletons,
+        &cli_version,
+    )
+    .context("building CLI schema JSON")?;
+    schema_codegen::write_schema_rs(&schema_json, &waldur_cli_dir.join("src"))
+        .context("writing schema.rs")?;
 
     println!(
         "Generated {} resource(s) across {} group(s), {} operation(s) used.",

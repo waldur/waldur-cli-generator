@@ -45,6 +45,11 @@ async marketplace-order flow instead of a direct REST create/delete. `provision`
 `{OfferingType}CreateOrderAttributes` schema spliced into its free-form `attributes` slot;
 the runtime polling lives in waldur-cli's hand-written `src/order.rs`.
 
+Finally, the generator compiles this entire command surface — paths, descriptions, parameters,
+types, and skeletons — into a single JSON structure emitted as `src/schema.rs`. This allows
+the CLI to serve a machine-readable tool specification (`waldur-cli schema`) to LLM agents
+without them having to parse `--help` text.
+
 ## Regenerating locally
 
 ```bash
@@ -53,8 +58,9 @@ cargo run -- waldur-openapi-schema.yaml ../waldur-cli
 
 Both arguments are optional: the schema path defaults to `waldur-openapi-schema.yaml` in the
 current directory (matching CI's downloaded artifact name), and the target dir defaults to a
-sibling `../waldur-cli`. This overwrites `waldur-cli`'s `src/commands/` and `src/cli.rs`
-wholesale -- see that repo's README for which files are hand-written and permanent instead.
+sibling `../waldur-cli`. This overwrites `waldur-cli`'s `src/commands/`, `src/cli.rs`, and
+`src/schema.rs` wholesale -- see that repo's README for which files are hand-written and
+permanent instead.
 
 ## License
 
