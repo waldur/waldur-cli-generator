@@ -585,10 +585,10 @@ fn generate_resource_module(
                     return Ok(());
                 }
                 let body = crate::request::load_body(args.request.as_deref(), args.request_file.as_deref())?;
-                crate::order::provision(base_url, token, &body, project, dry_run, !args.no_wait, args.timeout, format).await?;
+                crate::order::provision(base_url, token, &body, project, dry_run, !args.no_wait, args.timeout, args.interval, format).await?;
             }
             #resource_enum_ident::Terminate(args) => {
-                crate::order::terminate(base_url, token, &args.uuid, args.request.as_deref(), dry_run, !args.no_wait, args.timeout, format).await?;
+                crate::order::terminate(base_url, token, &args.uuid, args.request.as_deref(), dry_run, !args.no_wait, args.timeout, args.interval, format).await?;
             }
         });
 
@@ -622,6 +622,9 @@ fn generate_resource_module(
                     /// before giving up (ignored with --no-wait).
                     #[arg(long, default_value_t = 600)]
                     pub timeout: u64,
+                    /// Seconds between polls (ignored with --no-wait).
+                    #[arg(long, default_value_t = 3)]
+                    pub interval: u64,
                 }
                 #[derive(clap::Args, Debug)]
                 pub struct #terminate_args {
@@ -641,6 +644,9 @@ fn generate_resource_module(
                     /// up (ignored with --no-wait).
                     #[arg(long, default_value_t = 600)]
                     pub timeout: u64,
+                    /// Seconds between polls (ignored with --no-wait).
+                    #[arg(long, default_value_t = 3)]
+                    pub interval: u64,
                 }
             });
         });
