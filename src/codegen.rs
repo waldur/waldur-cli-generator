@@ -155,6 +155,18 @@ fn generate_resource_module(
         quote! { _project }
     };
 
+    // `--dry-run` is honored only by mutating verbs; a read-only resource
+    // takes the flag as `_dry_run` so there's no unused-argument warning.
+    let has_mutating_verb = ["create", "update", "delete"]
+        .iter()
+        .any(|v| resource.commands.contains_key(*v))
+        || resource.order.is_some();
+    let dry_run_param = if has_mutating_verb {
+        quote! { dry_run }
+    } else {
+        quote! { _dry_run }
+    };
+
     let mut verb_variants = Vec::new();
     let mut verb_arms = Vec::new();
     let mut skeleton_consts = Vec::new();
@@ -429,6 +441,7 @@ fn generate_resource_module(
             let request_ty: syn::Type = syn::parse_str(&format!("waldur_client::{request_ty_name}"))
                 .with_context(|| format!("invalid generated type name `{request_ty_name}`"))?;
             let method_expr = http_method_expr(op)?;
+            let method_str = op.http_verb.to_uppercase();
             let const_ident = format_ident!("{}_SKELETON", verb.to_uppercase());
             let path_stmts = body_path_stmts(op)?;
             quote! {
@@ -437,15 +450,21 @@ fn generate_resource_module(
                     return Ok(());
                 }
                 let body = crate::request::load_body(args.request.as_deref(), args.request_file.as_deref())?;
+                // Validate the body even under --dry-run, so a dry run still
+                // catches a malformed request rather than only previewing it.
                 serde_json::from_str::<#request_ty>(&body)
                     .with_context(|| "the request body is not valid JSON for this resource's request schema".to_string())?;
                 #path_stmts
+                if dry_run {
+                    return crate::output::print_dry_run(#method_str, &path, Some(&body), format);
+                }
                 let result = crate::http::call_one(base_url, token, #method_expr, &path, Some(&body)).await?;
                 crate::output::print_result(&result, COLUMNS, format)?;
             }
         } else {
             // delete
             let method_expr = http_method_expr(op)?;
+            let method_str = op.http_verb.to_uppercase();
             let uuid_ident = op
                 .path_param
                 .as_ref()
@@ -453,6 +472,9 @@ fn generate_resource_module(
                 .unwrap_or_else(|| format_ident!("uuid"));
             quote! {
                 let path = #path_expr;
+                if dry_run {
+                    return crate::output::print_dry_run(#method_str, &path, None, format);
+                }
                 let _ = crate::http::call_one(base_url, token, #method_expr, &path, None).await?;
                 match format {
                     crate::output::OutputFormat::Json => {
@@ -524,10 +546,10 @@ fn generate_resource_module(
                     return Ok(());
                 }
                 let body = crate::request::load_body(args.request.as_deref(), args.request_file.as_deref())?;
-                crate::order::provision(base_url, token, &body, project, !args.no_wait, args.timeout, format).await?;
+                crate::order::provision(base_url, token, &body, project, dry_run, !args.no_wait, args.timeout, format).await?;
             }
             #resource_enum_ident::Terminate(args) => {
-                crate::order::terminate(base_url, token, &args.uuid, args.request.as_deref(), !args.no_wait, args.timeout, format).await?;
+                crate::order::terminate(base_url, token, &args.uuid, args.request.as_deref(), dry_run, !args.no_wait, args.timeout, format).await?;
             }
         });
 
@@ -625,6 +647,7 @@ fn generate_resource_module(
             base_url: &str,
             token: Option<&str>,
             #project_param: Option<&str>,
+            #dry_run_param: bool,
             command: #resource_enum_ident,
             format: crate::output::OutputFormat,
         ) -> anyhow::Result<()> {
@@ -736,7 +759,7 @@ fn generate_cli_file(manifest: &Manifest) -> Result<String> {
             });
             resource_arms.push(quote! {
                 #group_enum_ident::#resource_variant_ident(cmd) => {
-                    crate::commands::#group_mod::#resource_mod::run(client, base_url, token, project, cmd, format).await
+                    crate::commands::#group_mod::#resource_mod::run(client, base_url, token, project, dry_run, cmd, format).await
                 }
             });
         }
@@ -787,6 +810,7 @@ fn generate_cli_file(manifest: &Manifest) -> Result<String> {
             base_url: &str,
             token: Option<&str>,
             project: Option<&str>,
+            dry_run: bool,
             command: GroupCommand,
             format: crate::output::OutputFormat,
         ) -> anyhow::Result<()> {
