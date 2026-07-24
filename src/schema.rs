@@ -76,6 +76,12 @@ pub struct RawSchema {
     pub one_of: Option<Vec<RawSchema>>,
     #[serde(rename = "anyOf", default)]
     pub any_of: Option<Vec<RawSchema>>,
+    /// JSON Schema's `format` keyword (e.g. `date-time`, `date`, `uuid`,
+    /// `email`) -- only consumed by request-body JSON Schema generation
+    /// (`build_request_json_schema`), which validates it at runtime. Ignored
+    /// everywhere else (skeletons/CLI flags don't need it).
+    #[serde(default)]
+    pub format: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -360,6 +366,133 @@ pub fn build_order_skeleton(doc: &OpenApiDoc, offering_type: Option<&str>) -> Re
     obj.insert("accepting_terms_of_service".to_string(), serde_json::Value::Bool(true));
     serde_json::to_string_pretty(&envelope)
         .with_context(|| format!("serializing order skeleton for `{offering_type:?}`"))
+}
+
+/// Builds a self-contained JSON Schema (every `$ref` inlined, no external
+/// lookups needed at runtime) for `schema_name`, for `waldur-cli` to validate
+/// `--request` bodies against directly -- replacing the old approach of
+/// deserializing into an rs-client-generated Rust struct purely to check
+/// shape. Embedded as a `const` in generated code, the same way
+/// `build_request_skeleton`'s output is.
+pub fn build_request_json_schema(doc: &OpenApiDoc, schema_name: &str) -> Result<String> {
+    let schema = doc
+        .components
+        .schemas
+        .get(schema_name)
+        .with_context(|| format!("schema `{schema_name}` not found"))?;
+    let mut seen = std::collections::HashSet::new();
+    seen.insert(schema_name.to_string());
+    let value = json_schema_value(doc, schema, &mut seen, 0);
+    serde_json::to_string(&value).with_context(|| format!("serializing JSON schema for `{schema_name}`"))
+}
+
+/// The JSON-Schema-node counterpart of `skeleton_value`: unlike a skeleton
+/// (which only needs *one* example value, so a `oneOf`/`allOf` union can just
+/// take its first member), a validation schema must preserve every
+/// combinator faithfully -- collapsing `allOf` to one member would silently
+/// stop enforcing the others. `$ref`s are still inlined (not left as JSON
+/// Schema `$ref`s pointing at a `definitions` block), so the emitted schema
+/// is fully self-contained and needs no resolver at runtime.
+fn json_schema_value(
+    doc: &OpenApiDoc,
+    schema: &RawSchema,
+    seen: &mut std::collections::HashSet<String>,
+    depth: usize,
+) -> serde_json::Value {
+    use serde_json::{json, Value};
+    // A cycle or excessive depth: fall back to JSON Schema's `true` (matches
+    // anything), rather than skeleton's `null` -- for validation, "don't
+    // know how to check this nested shape, so allow it" is the safe
+    // direction; rejecting valid data would be worse than under-validating a
+    // shape this deep/self-referential in practice.
+    if depth > SKELETON_MAX_DEPTH {
+        return Value::Bool(true);
+    }
+    if let Some(reference) = &schema.reference {
+        let name = reference.rsplit('/').next().unwrap_or(reference).to_string();
+        if seen.contains(&name) {
+            return Value::Bool(true);
+        }
+        if let Some(resolved) = doc.components.schemas.get(&name) {
+            seen.insert(name.clone());
+            let v = json_schema_value(doc, resolved, seen, depth + 1);
+            seen.remove(&name);
+            return v;
+        }
+        return Value::Bool(true);
+    }
+    // Real combinators, each member fully resolved -- not skeleton's
+    // take-the-first-member shortcut. A single-member `allOf` wrapping a
+    // `$ref` (drf-spectacular's way of attaching a sibling `description` to
+    // a `$ref`) round-trips as an `allOf` of one dereferenced schema, which
+    // is semantically identical to the `$ref` alone.
+    for (key, union) in [
+        ("allOf", &schema.all_of),
+        ("oneOf", &schema.one_of),
+        ("anyOf", &schema.any_of),
+    ] {
+        if let Some(members) = union {
+            let resolved: Vec<Value> = members
+                .iter()
+                .map(|m| json_schema_value(doc, m, seen, depth + 1))
+                .collect();
+            return json!({ key: resolved });
+        }
+    }
+    if let Some(values) = &schema.enum_values {
+        return json!({ "enum": values });
+    }
+    match schema.schema_type.as_deref() {
+        Some("string") => {
+            let mut obj = serde_json::Map::new();
+            obj.insert("type".to_string(), json!("string"));
+            if let Some(format) = &schema.format {
+                obj.insert("format".to_string(), json!(format));
+            }
+            Value::Object(obj)
+        }
+        Some("integer") => json!({ "type": "integer" }),
+        Some("number") => json!({ "type": "number" }),
+        Some("boolean") => json!({ "type": "boolean" }),
+        Some("array") => {
+            let items = schema
+                .items
+                .as_ref()
+                .map(|items| json_schema_value(doc, items, seen, depth + 1))
+                .unwrap_or(Value::Bool(true));
+            json!({ "type": "array", "items": items })
+        }
+        Some("object") | None => match &schema.properties {
+            Some(props) => {
+                // Read-only fields are dropped entirely (never part of a
+                // *written* request body -- same as skeleton_value), which
+                // means `required` has to be filtered to match, or a
+                // dropped-but-still-required field would make the schema
+                // reject every request.
+                let mut properties = serde_json::Map::new();
+                for (name, prop) in props {
+                    if prop.read_only {
+                        continue;
+                    }
+                    properties.insert(name.clone(), json_schema_value(doc, prop, seen, depth + 1));
+                }
+                let required: Vec<&str> = schema
+                    .required
+                    .as_deref()
+                    .unwrap_or(&[])
+                    .iter()
+                    .map(String::as_str)
+                    .filter(|name| properties.contains_key(*name))
+                    .collect();
+                json!({ "type": "object", "properties": properties, "required": required })
+            }
+            None if schema.schema_type.as_deref() == Some("object") => {
+                json!({ "type": "object" })
+            }
+            None => Value::Bool(true),
+        },
+        _ => Value::Bool(true),
+    }
 }
 
 /// A type-appropriate placeholder for one schema node. Mirrors AWS's skeleton

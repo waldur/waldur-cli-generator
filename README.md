@@ -2,12 +2,13 @@
 
 Generates [waldur-cli](https://code.opennodecloud.com/waldur/waldur-cli)'s command surface by
 parsing Waldur's OpenAPI schema directly -- the schema is the single source of truth for each
-operation's path, params, and request/response shape.
-[rs-client](https://code.opennodecloud.com/waldur/rs-client) is still used, purely as a source
-of typed request-body structs for validating `--request` JSON locally; waldur-cli itself makes
-raw HTTP calls (see `waldur-cli`'s `src/http.rs`/`src/pagination.rs`) rather than calling
-rs-client's generated methods, so a schema/response mismatch on a field nobody reads can never
-break a command the way it used to.
+operation's path, params, request/response shape, *and* request-body validation.
+[rs-client](https://code.opennodecloud.com/waldur/rs-client) is not a dependency of either repo:
+waldur-cli makes raw HTTP calls (see its `src/http.rs`/`src/pagination.rs`) rather than calling
+generated client methods, and validates `--request` JSON against a JSON Schema this generator
+extracts and embeds (`src/request.rs`'s `validate_request_body`), rather than deserializing into
+a separately-generated Rust struct. One source of truth end to end, so a schema drift on a field
+nobody reads -- or a stale request-body type -- can never break a command the way it used to.
 
 Mirrors the pattern already used by
 [ansible-waldur-generator](https://code.opennodecloud.com/waldur/ansible-waldur-generator) →

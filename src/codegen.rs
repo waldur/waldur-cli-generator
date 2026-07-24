@@ -132,6 +132,7 @@ fn generate_resource_module(
     operations: &HashMap<String, ExtractedOperation>,
     field_enum_values: &HashMap<String, Vec<String>>,
     request_skeletons: &HashMap<String, String>,
+    request_json_schemas: &HashMap<String, String>,
     order_skeletons: &HashMap<String, String>,
 ) -> Result<TokenStream> {
     let resource_pascal = pascal_case(&resource.name);
@@ -267,7 +268,15 @@ fn generate_resource_module(
             });
         }
         if *verb == "create" || *verb == "update" {
-            uses_context = true;
+            // update's uuid is `Option<String>` (see `uuid_optional` above,
+            // so --generate-skeleton can run without one) -- body_path_stmts
+            // emits `.context(...)` unwrapping it, the only place left that
+            // needs `Context` in scope now that request-body validation
+            // (crate::request::validate_request_body) returns its own
+            // fully-formed error rather than needing a `.with_context` wrapper.
+            if *verb == "update" && op.path_param.is_some() {
+                uses_context = true;
+            }
             // AWS-style body input: inline JSON, a JSON/YAML file, or print a
             // fillable template -- exactly one, enforced by a required arg
             // group. Discoverable in --help without a flag per schema field.
@@ -311,6 +320,14 @@ fn generate_resource_module(
             })?;
             let const_ident = format_ident!("{}_SKELETON", verb.to_uppercase());
             skeleton_consts.push(quote! { const #const_ident: &str = #skeleton; });
+            // Embed the JSON Schema `--request` is validated against at
+            // runtime (crate::request::validate_request_body), replacing the
+            // old rs-client-typed-struct deserialize-to-validate approach.
+            let json_schema = request_json_schemas.get(type_name).with_context(|| {
+                format!("internal error: no JSON schema built for request type `{type_name}`")
+            })?;
+            let schema_const_ident = format_ident!("{}_REQUEST_SCHEMA", verb.to_uppercase());
+            skeleton_consts.push(quote! { const #schema_const_ident: &str = #json_schema; });
         }
 
         // Client-side only -- not part of the schema (list has no "limit"
@@ -450,18 +467,23 @@ fn generate_resource_module(
                 crate::output::print_result(&result, COLUMNS, format)?;
             }
         } else if *verb == "create" || *verb == "update" {
-            let request_ty_name = op.request_body_type.as_deref().with_context(|| {
+            // Only needed to confirm this operation actually has a request
+            // body to validate against (should always be true for
+            // create/update, but bail loudly rather than silently skip
+            // validation if the schema is ever missing one) -- the schema
+            // itself is looked up by #schema_const_ident below, embedded at
+            // generation time.
+            op.request_body_type.as_deref().with_context(|| {
                 format!(
                     "resource `{}`, verb `{verb}` ({method_name}): couldn't find this \
                      operation's request body schema -- needed to validate --request",
                     resource.name
                 )
             })?;
-            let request_ty: syn::Type = syn::parse_str(&format!("waldur_client::{request_ty_name}"))
-                .with_context(|| format!("invalid generated type name `{request_ty_name}`"))?;
             let method_expr = http_method_expr(op)?;
             let method_str = op.http_verb.to_uppercase();
             let const_ident = format_ident!("{}_SKELETON", verb.to_uppercase());
+            let schema_const_ident = format_ident!("{}_REQUEST_SCHEMA", verb.to_uppercase());
             let path_stmts = body_path_stmts(op)?;
             quote! {
                 if let Some(fmt) = args.generate_skeleton {
@@ -471,8 +493,7 @@ fn generate_resource_module(
                 let body = crate::request::load_body(args.request.as_deref(), args.request_file.as_deref())?;
                 // Validate the body even under --dry-run, so a dry run still
                 // catches a malformed request rather than only previewing it.
-                serde_json::from_str::<#request_ty>(&body)
-                    .with_context(|| "the request body is not valid JSON for this resource's request schema".to_string())?;
+                crate::request::validate_request_body(#schema_const_ident, &body)?;
                 #path_stmts
                 if dry_run {
                     return crate::output::print_dry_run(#method_str, &path, Some(&body), format);
@@ -662,7 +683,6 @@ fn generate_resource_module(
         #(#args_structs)*
 
         pub async fn run(
-            _client: &waldur_client::HttpClient,
             base_url: &str,
             token: Option<&str>,
             #project_param: Option<&str>,
@@ -705,6 +725,7 @@ pub fn generate_all(
     operations: &HashMap<String, ExtractedOperation>,
     field_enum_values: &HashMap<String, Vec<String>>,
     request_skeletons: &HashMap<String, String>,
+    request_json_schemas: &HashMap<String, String>,
     order_skeletons: &HashMap<String, String>,
 ) -> Result<GeneratedOutput> {
     let mut resources = Vec::new();
@@ -713,7 +734,7 @@ pub fn generate_all(
     for group in &manifest.group {
         let mut resource_mod_decls = Vec::new();
         for resource in &group.resource {
-            let tokens = generate_resource_module(resource, operations, field_enum_values, request_skeletons, order_skeletons)
+            let tokens = generate_resource_module(resource, operations, field_enum_values, request_skeletons, request_json_schemas, order_skeletons)
                 .with_context(|| format!("generating group `{}` resource `{}`", group.name, resource.name))?;
             let file: syn::File = syn::parse2(tokens.clone()).with_context(|| {
                 format!(
@@ -778,7 +799,7 @@ fn generate_cli_file(manifest: &Manifest) -> Result<String> {
             });
             resource_arms.push(quote! {
                 #group_enum_ident::#resource_variant_ident(cmd) => {
-                    crate::commands::#group_mod::#resource_mod::run(client, base_url, token, project, dry_run, cmd, format).await
+                    crate::commands::#group_mod::#resource_mod::run(base_url, token, project, dry_run, cmd, format).await
                 }
             });
         }
@@ -825,7 +846,6 @@ fn generate_cli_file(manifest: &Manifest) -> Result<String> {
         #(#group_enums)*
 
         pub async fn dispatch(
-            client: &waldur_client::HttpClient,
             base_url: &str,
             token: Option<&str>,
             project: Option<&str>,
