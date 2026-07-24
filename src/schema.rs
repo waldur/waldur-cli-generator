@@ -230,7 +230,21 @@ pub fn extract_operation(doc: &OpenApiDoc, operation_id: &str) -> Result<Extract
     }
     let (path, http_verb, op) = found
         .with_context(|| format!("operationId `{operation_id}` not found in OpenAPI schema"))?;
+    extract_from_found(doc, path, http_verb, op)
+}
 
+/// The actual extraction logic, shared by `extract_operation` (which finds
+/// its `(path, verb, op)` by searching for a known operationId) and
+/// `discover_actions` (which finds them by scanning paths instead, since a
+/// custom action's operationId isn't known ahead of time -- only the path
+/// convention it lives at is).
+fn extract_from_found(
+    doc: &OpenApiDoc,
+    path: &str,
+    http_verb: &str,
+    op: &RawOperation,
+) -> Result<ExtractedOperation> {
+    let operation_id = op.operation_id.as_str();
     let mut path_param: Option<String> = None;
     let mut query_params = Vec::new();
     let mut field_enum_name: Option<String> = None;
@@ -293,6 +307,49 @@ pub fn extract_operation(doc: &OpenApiDoc, operation_id: &str) -> Result<Extract
         field_enum_name,
         request_body_type,
     })
+}
+
+/// A discovered custom action: its own name (the CLI verb) alongside the
+/// fully-extracted operation, same shape as any other verb.
+#[derive(Debug, Clone)]
+pub struct ExtractedAction {
+    /// The action's own name -- the path's last segment (e.g. `"start"`,
+    /// `"approve_by_consumer"`), becomes the CLI verb.
+    pub name: String,
+    pub operation: ExtractedOperation,
+}
+
+/// Discovers a resource's custom actions: POST/PUT/... operations at
+/// `{base_path}{action}/`, one path segment beyond `base_path` (the
+/// resource's own uuid-scoped path, e.g. `/api/openstack-instances/{uuid}/`)
+/// -- Waldur's convention throughout for state-changing operations that
+/// aren't a plain REST create/update/delete (start/stop/restart, attach/
+/// detach, approve/reject, ...). Only scans paths beneath `base_path`, never
+/// the whole schema, so this can't accidentally pull in some other
+/// resource's actions. A path with its own further path parameter (a nested
+/// sub-resource, e.g. `{base_path}networks/{network_uuid}/`) is not an
+/// action and is skipped, not just one with more than one segment.
+pub fn discover_actions(doc: &OpenApiDoc, base_path: &str, exclude: &[String]) -> Result<Vec<ExtractedAction>> {
+    let mut actions = Vec::new();
+    for (path, methods) in &doc.paths {
+        let Some(rest) = path.strip_prefix(base_path) else { continue };
+        if rest.is_empty() || rest.contains('{') {
+            continue;
+        }
+        let name = rest.trim_end_matches('/').to_string();
+        if name.is_empty() || name.contains('/') || exclude.contains(&name) {
+            continue;
+        }
+        for (verb, op) in methods {
+            let operation = extract_from_found(doc, path, verb, op)
+                .with_context(|| format!("discovering action `{name}` at `{path}`"))?;
+            actions.push(ExtractedAction { name: name.clone(), operation });
+        }
+    }
+    // Deterministic order across regenerations, independent of the source
+    // HashMap's iteration order.
+    actions.sort_by(|a, b| a.name.cmp(&b.name));
+    Ok(actions)
 }
 
 /// Resolves a flat `{type: string, enum: [...]}` schema's values by name
@@ -767,6 +824,73 @@ components: {}
         assert_eq!(op.request_body_type, None);
         assert_eq!(op.path_param, None);
         assert!(op.query_params.is_empty());
+    }
+
+    // -- discover_actions -----------------------------------------------------
+
+    fn actions_doc() -> OpenApiDoc {
+        doc(
+            r#"
+paths:
+  /api/things/{uuid}/:
+    get:
+      operationId: things_retrieve
+  /api/things/{uuid}/start/:
+    post:
+      operationId: things_start
+  /api/things/{uuid}/pull/:
+    post:
+      operationId: things_pull
+  /api/things/{uuid}/history/at/:
+    get:
+      operationId: things_history_at
+  /api/other/{uuid}/detach/:
+    post:
+      operationId: other_detach
+components: {}
+"#,
+        )
+    }
+
+    #[test]
+    fn discover_actions_finds_direct_children_of_the_base_path() {
+        let d = actions_doc();
+        let actions = discover_actions(&d, "/api/things/{uuid}/", &[]).unwrap();
+        let names: Vec<&str> = actions.iter().map(|a| a.name.as_str()).collect();
+        assert_eq!(names, vec!["pull", "start"]);
+    }
+
+    #[test]
+    fn discover_actions_skips_deeper_nested_paths() {
+        let d = actions_doc();
+        let actions = discover_actions(&d, "/api/things/{uuid}/", &[]).unwrap();
+        assert!(actions.iter().all(|a| a.name != "history/at"));
+    }
+
+    #[test]
+    fn discover_actions_ignores_paths_outside_the_base() {
+        let d = actions_doc();
+        let actions = discover_actions(&d, "/api/things/{uuid}/", &[]).unwrap();
+        assert!(actions.iter().all(|a| a.name != "detach"));
+    }
+
+    #[test]
+    fn discover_actions_respects_the_exclude_list() {
+        let d = actions_doc();
+        let actions =
+            discover_actions(&d, "/api/things/{uuid}/", &["pull".to_string()]).unwrap();
+        let names: Vec<&str> = actions.iter().map(|a| a.name.as_str()).collect();
+        assert_eq!(names, vec!["start"]);
+    }
+
+    #[test]
+    fn discover_actions_sorts_by_name_deterministically() {
+        let d = actions_doc();
+        let actions = discover_actions(&d, "/api/things/{uuid}/", &[]).unwrap();
+        let names: Vec<&str> = actions.iter().map(|a| a.name.as_str()).collect();
+        let mut sorted = names.clone();
+        sorted.sort();
+        assert_eq!(names, sorted);
     }
 
     // -- extract_enum_values ------------------------------------------------

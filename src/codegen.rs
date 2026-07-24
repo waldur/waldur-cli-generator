@@ -1,5 +1,5 @@
 use crate::manifest::{Manifest, Resource, KNOWN_VERBS};
-use crate::schema::{ExtractedOperation, ParamKind};
+use crate::schema::{ExtractedAction, ExtractedOperation, ParamKind};
 use anyhow::{bail, Context, Result};
 use proc_macro2::TokenStream;
 use quote::{format_ident, quote};
@@ -782,7 +782,142 @@ fn emit_wait_verb(
     Ok(EmittedVerb { variant, arm, args_struct, consts: quote! {}, needs_context: false })
 }
 
+/// Turns a schema action name like `approve_by_consumer` into a natural
+/// sentence-style phrase (`Approve by consumer`) for doc comments -- unlike
+/// `pascal_case`, which produces the Rust identifier (`ApproveByConsumer`).
+fn capitalize_words(name: &str) -> String {
+    let spaced = name.replace('_', " ");
+    let mut chars = spaced.chars();
+    match chars.next() {
+        Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
+        None => String::new(),
+    }
+}
+
+/// A custom action discovered by `schema::discover_actions` -- Waldur's
+/// convention for state-changing operations that aren't a plain REST
+/// create/update/delete (start/stop/restart, attach/detach, approve/reject,
+/// ...). Mirrors `emit_body_verb`'s request/request-file/generate-skeleton
+/// shape when the action takes a body, or a bare no-body POST (`get`'s
+/// shape, but mutating) when it doesn't -- both real cases in practice
+/// (`openstack_instances_start` takes nothing; `openstack_volumes_attach`
+/// takes a device path).
+fn emit_action_verb(
+    resource: &Resource,
+    resource_pascal: &str,
+    resource_enum_ident: &proc_macro2::Ident,
+    action: &ExtractedAction,
+    request_skeletons: &HashMap<String, String>,
+    request_json_schemas: &HashMap<String, String>,
+) -> Result<EmittedVerb> {
+    let op = &action.operation;
+    let action_pascal = pascal_case(&action.name);
+    let args_ident = format_ident!("{}{}Args", resource_pascal, action_pascal);
+    let variant_ident = format_ident!("{}", action_pascal);
+    let about = format!("{} {}", capitalize_words(&action.name), resource.about.to_lowercase());
+    let variant = quote! {
+        #[doc = #about]
+        #variant_ident(#args_ident),
+    };
+
+    let mut field_defs = Vec::new();
+    if let Some(field) = path_param_field(op, false) {
+        field_defs.push(field);
+    }
+
+    let path_expr = build_path_expr(op)?;
+    let method_expr = http_method_expr(op)?;
+    let method_str = op.http_verb.to_uppercase();
+
+    let (output_stmt, struct_attr, consts) = match op.request_body_type.as_deref() {
+        Some(type_name) => {
+            field_defs.push(quote! {
+                /// Request body as inline JSON. Use --generate-skeleton for
+                /// a template, or --request-file to read it from a file.
+                #[arg(long)]
+                pub request: Option<String>,
+            });
+            field_defs.push(quote! {
+                /// Read the request body from a JSON or YAML file (e.g. a
+                /// filled-in --generate-skeleton template).
+                #[arg(long, value_name = "PATH")]
+                pub request_file: Option<std::path::PathBuf>,
+            });
+            field_defs.push(quote! {
+                /// Print a fillable request-body template and exit, instead
+                /// of sending a request (json or yaml; default json).
+                #[arg(long, value_enum, num_args = 0..=1, default_missing_value = "json", value_name = "FORMAT")]
+                pub generate_skeleton: Option<crate::request::SkeletonFormat>,
+            });
+            let group_name = format!("{}_{}_body", resource.name.replace('-', "_"), action.name);
+            let struct_attr = quote! {
+                #[command(group(
+                    clap::ArgGroup::new(#group_name)
+                        .required(true)
+                        .args(["request", "request_file", "generate_skeleton"])
+                ))]
+            };
+
+            let skeleton = request_skeletons.get(type_name).with_context(|| {
+                format!("internal error: no skeleton built for request type `{type_name}`")
+            })?;
+            let const_ident = format_ident!("{}_SKELETON", action.name.to_uppercase());
+            let json_schema = request_json_schemas.get(type_name).with_context(|| {
+                format!("internal error: no JSON schema built for request type `{type_name}`")
+            })?;
+            let schema_const_ident = format_ident!("{}_REQUEST_SCHEMA", action.name.to_uppercase());
+            let consts = quote! {
+                const #const_ident: &str = #skeleton;
+                const #schema_const_ident: &str = #json_schema;
+            };
+
+            let stmt = quote! {
+                if let Some(fmt) = args.generate_skeleton {
+                    crate::request::print_skeleton(#const_ident, fmt)?;
+                    return Ok(());
+                }
+                let body = crate::request::load_body(args.request.as_deref(), args.request_file.as_deref())?;
+                crate::request::validate_request_body(#schema_const_ident, &body)?;
+                let path = #path_expr;
+                if dry_run {
+                    return crate::output::print_dry_run(#method_str, &path, Some(&body), format);
+                }
+                let result = crate::http::call_one(base_url, token, #method_expr, &path, Some(&body)).await?;
+                crate::output::print_result(&result, COLUMNS, format)?;
+            };
+            (stmt, struct_attr, consts)
+        }
+        None => {
+            let stmt = quote! {
+                let path = #path_expr;
+                if dry_run {
+                    return crate::output::print_dry_run(#method_str, &path, None, format);
+                }
+                let result = crate::http::call_one(base_url, token, #method_expr, &path, None).await?;
+                crate::output::print_result(&result, COLUMNS, format)?;
+            };
+            (stmt, quote! {}, quote! {})
+        }
+    };
+
+    let arm = quote! {
+        #resource_enum_ident::#variant_ident(args) => {
+            #output_stmt
+        }
+    };
+    let args_struct = quote! {
+        #[derive(clap::Args, Debug)]
+        #struct_attr
+        pub struct #args_ident {
+            #(#field_defs)*
+        }
+    };
+
+    Ok(EmittedVerb { variant, arm, args_struct, consts, needs_context: false })
+}
+
 /// One resource's generated file: Args structs + Command enum + run().
+#[allow(clippy::too_many_arguments)]
 fn generate_resource_module(
     resource: &Resource,
     operations: &HashMap<String, ExtractedOperation>,
@@ -790,6 +925,7 @@ fn generate_resource_module(
     request_skeletons: &HashMap<String, String>,
     request_json_schemas: &HashMap<String, String>,
     order_skeletons: &HashMap<String, String>,
+    resource_actions: &HashMap<String, Vec<ExtractedAction>>,
 ) -> Result<TokenStream> {
     let resource_pascal = pascal_case(&resource.name);
     let resource_enum_ident = format_ident!("{}Command", resource_pascal);
@@ -812,12 +948,15 @@ fn generate_resource_module(
         quote! { _project }
     };
 
-    // `--dry-run` is honored only by mutating verbs; a read-only resource
-    // takes the flag as `_dry_run` so there's no unused-argument warning.
+    // `--dry-run` is honored only by mutating verbs (including every
+    // discovered action, which all emit their own `if dry_run` check); a
+    // read-only resource takes the flag as `_dry_run` so there's no
+    // unused-argument warning.
     let has_mutating_verb = ["create", "update", "delete"]
         .iter()
         .any(|v| resource.commands.contains_key(*v))
-        || resource.order.is_some();
+        || resource.order.is_some()
+        || resource_actions.get(&resource.name).is_some_and(|actions| !actions.is_empty());
     let dry_run_param = if has_mutating_verb {
         quote! { dry_run }
     } else {
@@ -869,6 +1008,42 @@ fn generate_resource_module(
 
     if let Some(get_method_name) = resource.commands.get("get") {
         emitted.push(emit_wait_verb(resource, &resource_pascal, &resource_enum_ident, operations, get_method_name)?);
+    }
+
+    // Auto-discovered custom actions (start/stop/restart, attach/detach,
+    // approve/reject, ...), if this resource opted in via [actions]. Guard
+    // against a discovered action colliding with one of the fixed verb
+    // names above -- Waldur's own naming has never produced one in
+    // practice, but silently emitting two enum variants with the same
+    // identifier would be a confusing generated-code compile error rather
+    // than a clear one here.
+    if let Some(actions) = resource_actions.get(&resource.name) {
+        let mut used_names: std::collections::HashSet<&str> = resource.commands.keys().map(String::as_str).collect();
+        if resource.order.is_some() {
+            used_names.insert("provision");
+            used_names.insert("terminate");
+        }
+        if resource.commands.contains_key("get") {
+            used_names.insert("wait");
+        }
+        for action in actions {
+            if used_names.contains(action.name.as_str()) {
+                bail!(
+                    "resource `{}`: discovered action `{}` collides with an existing verb name -- \
+                     add it to this resource's [actions] `exclude` list",
+                    resource.name,
+                    action.name
+                );
+            }
+            emitted.push(emit_action_verb(
+                resource,
+                &resource_pascal,
+                &resource_enum_ident,
+                action,
+                request_skeletons,
+                request_json_schemas,
+            )?);
+        }
     }
 
     let verb_variants = emitted.iter().map(|e| &e.variant);
@@ -942,6 +1117,7 @@ pub struct GeneratedOutput {
     pub cli_source: String,
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn generate_all(
     manifest: &Manifest,
     operations: &HashMap<String, ExtractedOperation>,
@@ -949,6 +1125,7 @@ pub fn generate_all(
     request_skeletons: &HashMap<String, String>,
     request_json_schemas: &HashMap<String, String>,
     order_skeletons: &HashMap<String, String>,
+    resource_actions: &HashMap<String, Vec<ExtractedAction>>,
 ) -> Result<GeneratedOutput> {
     let mut resources = Vec::new();
     let mut group_mod_decls: HashMap<String, String> = HashMap::new();
@@ -956,8 +1133,16 @@ pub fn generate_all(
     for group in &manifest.group {
         let mut resource_mod_decls = Vec::new();
         for resource in &group.resource {
-            let tokens = generate_resource_module(resource, operations, field_enum_values, request_skeletons, request_json_schemas, order_skeletons)
-                .with_context(|| format!("generating group `{}` resource `{}`", group.name, resource.name))?;
+            let tokens = generate_resource_module(
+                resource,
+                operations,
+                field_enum_values,
+                request_skeletons,
+                request_json_schemas,
+                order_skeletons,
+                resource_actions,
+            )
+            .with_context(|| format!("generating group `{}` resource `{}`", group.name, resource.name))?;
             let file: syn::File = syn::parse2(tokens.clone()).with_context(|| {
                 format!(
                     "generated code for group `{}` resource `{}` is not valid Rust:\n{}",
@@ -1100,6 +1285,7 @@ mod tests {
             columns: vec!["uuid".to_string()],
             commands: commands.iter().map(|(v, m)| (v.to_string(), m.to_string())).collect::<BTreeMap<_, _>>(),
             order,
+            actions: None,
         }
     }
 
@@ -1253,6 +1439,84 @@ mod tests {
         assert!(variant.contains("Terminate (ThingTerminateArgs)"));
         assert!(rendered(&emitted.arm).contains("crate :: order :: provision"));
         assert!(rendered(&emitted.arm).contains("crate :: order :: terminate"));
+    }
+
+    // -- emit_action_verb -------------------------------------------------
+
+    fn action(name: &str, path: &str, verb: &str, request_body_type: Option<&str>) -> ExtractedAction {
+        let mut operation = op(path, verb, Some("uuid"));
+        operation.request_body_type = request_body_type.map(str::to_string);
+        ExtractedAction { name: name.to_string(), operation }
+    }
+
+    #[test]
+    fn emit_action_verb_bodyless_action_is_a_bare_call() {
+        let resource = resource("thing", &[], None);
+        let ident = format_ident!("ThingCommand");
+        let empty: HashMap<String, String> = HashMap::new();
+        let start = action("start", "/api/things/{uuid}/start/", "post", None);
+
+        let emitted = emit_action_verb(&resource, "Thing", &ident, &start, &empty, &empty).unwrap();
+        assert!(rendered(&emitted.variant).contains("Start (ThingStartArgs)"));
+        assert!(rendered(&emitted.args_struct).contains("pub uuid : String"));
+        assert!(!rendered(&emitted.args_struct).contains("request"));
+        assert!(rendered(&emitted.arm).contains("call_one"));
+        assert!(!emitted.needs_context);
+    }
+
+    #[test]
+    fn emit_action_verb_body_having_action_gets_request_args_and_consts() {
+        let resource = resource("thing", &[], None);
+        let ident = format_ident!("ThingCommand");
+        let skeletons: HashMap<String, String> = [("SomeRequest".to_string(), "{}".to_string())].into();
+        let change = action("change_flavor", "/api/things/{uuid}/change_flavor/", "post", Some("SomeRequest"));
+
+        let emitted =
+            emit_action_verb(&resource, "Thing", &ident, &change, &skeletons, &skeletons).unwrap();
+        assert!(rendered(&emitted.variant).contains("ChangeFlavor (ThingChangeFlavorArgs)"));
+        assert!(rendered(&emitted.args_struct).contains("pub request : Option < String >"));
+        assert!(rendered(&emitted.args_struct).contains("pub generate_skeleton"));
+        assert!(rendered(&emitted.consts).contains("CHANGE_FLAVOR_SKELETON"));
+        assert!(rendered(&emitted.consts).contains("CHANGE_FLAVOR_REQUEST_SCHEMA"));
+        assert!(rendered(&emitted.arm).contains("validate_request_body"));
+    }
+
+    #[test]
+    fn emit_action_verb_missing_request_schema_is_a_clear_error() {
+        let resource = resource("thing", &[], None);
+        let ident = format_ident!("ThingCommand");
+        let empty: HashMap<String, String> = HashMap::new();
+        let change = action("change_flavor", "/api/things/{uuid}/change_flavor/", "post", Some("SomeRequest"));
+
+        let err = emit_action_verb(&resource, "Thing", &ident, &change, &empty, &empty).unwrap_err();
+        assert!(err.to_string().contains("no skeleton built"));
+    }
+
+    #[test]
+    fn generate_resource_module_bails_when_an_action_collides_with_an_existing_verb() {
+        let resource = resource("thing", &[("get", "things_get")], None);
+        let mut operations = HashMap::new();
+        operations.insert("things_get".to_string(), op("/api/things/{uuid}/", "get", Some("uuid")));
+        let empty_map: HashMap<String, Vec<String>> = HashMap::new();
+        let empty_skeletons: HashMap<String, String> = HashMap::new();
+        let order_skeletons: HashMap<String, String> = HashMap::new();
+        let mut resource_actions: HashMap<String, Vec<ExtractedAction>> = HashMap::new();
+        resource_actions.insert(
+            "thing".to_string(),
+            vec![action("wait", "/api/things/{uuid}/wait/", "post", None)],
+        );
+
+        let err = generate_resource_module(
+            &resource,
+            &operations,
+            &empty_map,
+            &empty_skeletons,
+            &empty_skeletons,
+            &order_skeletons,
+            &resource_actions,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("collides with an existing verb name"));
     }
 
     // -- small free functions -------------------------------------------

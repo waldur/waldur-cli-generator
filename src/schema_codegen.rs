@@ -502,6 +502,7 @@ mod tests {
             columns: vec!["uuid".to_string(), "name".to_string()],
             commands: commands.iter().map(|(v, m)| (v.to_string(), m.to_string())).collect(),
             order,
+            actions: None,
         }
     }
 

@@ -50,12 +50,43 @@ fn main() -> Result<()> {
         operations.insert(operation_id.clone(), op);
     }
 
+    // Auto-discover custom actions (start/stop/restart, attach/detach,
+    // approve/reject, ...) for every resource with an `[actions]` config --
+    // POST/PUT/... operations at `{resource's own uuid-scoped path}{action}/`,
+    // Waldur's convention throughout for state-changing operations that
+    // aren't a plain REST create/update/delete. Keyed by resource name
+    // (a resource can have several). Discovery needs the resource's own
+    // `get` to know its base path, so it's required (same as `wait`).
+    let mut resource_actions: HashMap<String, Vec<schema::ExtractedAction>> = HashMap::new();
+    for resource in manifest.group.iter().flat_map(|g| &g.resource) {
+        let Some(actions_config) = &resource.actions else { continue };
+        let get_method_name = resource.commands.get("get").with_context(|| {
+            format!(
+                "resource `{}` has an [actions] config but no `get` -- action discovery \
+                 needs get's own path to know the resource's base path to scan beneath",
+                resource.name
+            )
+        })?;
+        let get_op = operations.get(get_method_name).with_context(|| {
+            format!("internal error: operation `{get_method_name}` was not extracted")
+        })?;
+        let actions = schema::discover_actions(&doc, &get_op.path, &actions_config.exclude)
+            .with_context(|| format!("discovering actions for resource `{}`", resource.name))?;
+        resource_actions.insert(resource.name.clone(), actions);
+    }
+    // Every discovered action's own ExtractedOperation, alongside the
+    // manifest-declared ones -- needed below so field_enum_values/
+    // request_skeletons/request_json_schemas cover actions' request bodies
+    // too, not just create/update/provision's.
+    let action_operations: Vec<&schema::ExtractedOperation> =
+        resource_actions.values().flatten().map(|a| &a.operation).collect();
+
     // Resolve valid --fields values for every list operation that has a
     // `field` query param, so codegen can validate --fields client-side
     // instead of silently sending a bad name the server will just as
     // silently ignore.
     let mut field_enum_values: HashMap<String, Vec<String>> = HashMap::new();
-    for op in operations.values() {
+    for op in operations.values().chain(action_operations.iter().copied()) {
         let Some(enum_name) = &op.field_enum_name else { continue };
         if field_enum_values.contains_key(enum_name) {
             continue;
@@ -70,7 +101,7 @@ fn main() -> Result<()> {
     // by the request type name, since the same type is reused across
     // operations (e.g. a resource's create and update).
     let mut request_skeletons: HashMap<String, String> = HashMap::new();
-    for op in operations.values() {
+    for op in operations.values().chain(action_operations.iter().copied()) {
         let Some(type_name) = &op.request_body_type else { continue };
         if request_skeletons.contains_key(type_name) {
             continue;
@@ -87,7 +118,7 @@ fn main() -> Result<()> {
     // request-body validation can never drift out of sync with it. Keyed
     // the same way as the skeletons.
     let mut request_json_schemas: HashMap<String, String> = HashMap::new();
-    for op in operations.values() {
+    for op in operations.values().chain(action_operations.iter().copied()) {
         let Some(type_name) = &op.request_body_type else { continue };
         if request_json_schemas.contains_key(type_name) {
             continue;
@@ -115,6 +146,7 @@ fn main() -> Result<()> {
         &request_skeletons,
         &request_json_schemas,
         &order_skeletons,
+        &resource_actions,
     )
     .context("generating CLI source")?;
 

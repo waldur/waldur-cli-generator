@@ -40,6 +40,34 @@ about = "Manage OpenStack resources"
     update = "openstack_instances_update"
     [group.resource.order]
     offering_type = "OpenStack.Instance"
+    [group.resource.actions]
+    # Auto-discovered from /api/openstack-instances/{uuid}/{action}/. Scoped
+    # for now to bodyless POST actions only (start/stop/restart/set_ok/
+    # unlink/unrescue) -- GET actions (console/console_log/floating_ips/
+    # placement_allocations/ports) and body-having actions (backup/
+    # change_flavor/diagnose_connectivity/rescue/set_erred/
+    # update_allowed_address_pairs/update_floating_ips/update_ports/
+    # update_security_groups) are excluded for now, to keep the first
+    # rollout to a simpler surface; revisit once there's a concrete need.
+    # `pull` is Waldur's own backend-sync trigger, not something a CLI user
+    # calls directly.
+    exclude = [
+      "pull",
+      "console",
+      "console_log",
+      "floating_ips",
+      "placement_allocations",
+      "ports",
+      "backup",
+      "change_flavor",
+      "diagnose_connectivity",
+      "rescue",
+      "set_erred",
+      "update_allowed_address_pairs",
+      "update_floating_ips",
+      "update_ports",
+      "update_security_groups",
+    ]
 
   [[group.resource]]
   name = "volume"
@@ -51,6 +79,11 @@ about = "Manage OpenStack resources"
     update = "openstack_volumes_update"
     [group.resource.order]
     offering_type = "OpenStack.Volume"
+    [group.resource.actions]
+    # Scoped to bodyless POST actions only (see the instance resource's
+    # actions comment above for the rationale); body-having actions (attach/
+    # extend/retype/set_erred/snapshot) are excluded for now.
+    exclude = ["pull", "attach", "extend", "retype", "set_erred", "snapshot"]
 
   [[group.resource]]
   name = "network"
@@ -90,6 +123,11 @@ about = "Manage OpenStack resources"
     list = "openstack_floating_ips_list"
     get = "openstack_floating_ips_retrieve"
     delete = "openstack_floating_ips_destroy"
+    [group.resource.actions]
+    # Scoped to bodyless POST actions only (see the instance resource's
+    # actions comment above for the rationale); body-having actions
+    # (attach_to_port/set_erred/update_description) are excluded for now.
+    exclude = ["pull", "attach_to_port", "set_erred", "update_description"]
 
 [[group]]
 name = "team"
@@ -211,6 +249,45 @@ about = "Browse offerings and provision resources of any offering type"
     get = "marketplace_resources_retrieve"
     [group.resource.order]
     # no offering_type -> generic provision (free-form attributes)
+    [group.resource.actions]
+    # Scoped to bodyless POST actions only (see the instance resource's
+    # actions comment above for the rationale) -- excludes both the
+    # body-having actions and the GET-based read-only sub-resource lookups
+    # (details/history/team/...), leaving just `unlink`. `terminate` is
+    # excluded even though bodyless: it collides with the hand-written
+    # order-based `terminate` above.
+    exclude = [
+      "pull",
+      "terminate",
+      "add_user",
+      "adjust_dates",
+      "delete_user",
+      "estimate_renewal",
+      "move_resource",
+      "reallocate_limits",
+      "renew",
+      "restore",
+      "set_downscaled",
+      "set_end_date",
+      "set_end_date_by_staff",
+      "set_paused",
+      "set_restrict_member_access",
+      "set_slug",
+      "switch_plan",
+      "update_limits",
+      "update_options",
+      "update_user",
+      "details",
+      "glauth_tree",
+      "glauth_users_config",
+      "history",
+      "list_users",
+      "offering",
+      "offering_for_subresources",
+      "plan_periods",
+      "team",
+      "team_members",
+    ]
 
   # get-only: an order's uuid is what `provision --no-wait` prints, and this
   # is the direct way to check on (or `wait` for) it afterwards, rather than
@@ -222,3 +299,21 @@ about = "Browse offerings and provision resources of any offering type"
   columns = ["uuid", "state", "resource_uuid", "error_message"]
     [group.resource.commands]
     get = "marketplace_orders_retrieve"
+    [group.resource.actions]
+    # Scoped to bodyless POST actions only (see the instance resource's
+    # actions comment above for the rationale); body-having actions
+    # (approve_by_provider/reject_by_*/set_backend_id/set_consumer_info/
+    # set_provider_info/set_state_erred/update_attachment) and GET actions
+    # (offering/resource) are excluded for now.
+    exclude = [
+      "approve_by_provider",
+      "reject_by_consumer",
+      "reject_by_provider",
+      "set_backend_id",
+      "set_consumer_info",
+      "set_provider_info",
+      "set_state_erred",
+      "update_attachment",
+      "offering",
+      "resource",
+    ]

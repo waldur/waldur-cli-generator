@@ -24,6 +24,28 @@ pub struct Resource {
     /// adds `provision`/`terminate` subcommands. See `OrderConfig`.
     #[serde(default)]
     pub order: Option<OrderConfig>,
+    /// Set to auto-discover this resource's custom actions -- Waldur's
+    /// convention for state-changing operations that aren't a plain REST
+    /// create/update/delete (start/stop/restart, attach/detach, approve/
+    /// reject, ...), each a POST at `{this resource's own uuid-scoped
+    /// path}{action}/`. Absent means no discovery at all (opt-in per
+    /// resource, so a regen doesn't suddenly sprout new commands for every
+    /// resource at once). See `ActionsConfig`.
+    #[serde(default)]
+    pub actions: Option<ActionsConfig>,
+}
+
+/// Custom-action discovery config for a resource. Discovery itself is
+/// unconditional once this is present (every `{uuid}/{action}/` path found
+/// under the resource's own base path gets a CLI verb) -- `exclude` is an
+/// opt-out list for the ones that aren't meant for direct CLI use (Waldur's
+/// own `pull`/`sync_*` housekeeping actions, mostly), not an opt-in
+/// allow-list, so newly-added actions on the Waldur side show up on the
+/// next regen without needing a commands.toml change to notice them.
+#[derive(Debug, Deserialize, Default)]
+pub struct ActionsConfig {
+    #[serde(default)]
+    pub exclude: Vec<String>,
 }
 
 /// Marketplace-order provisioning config for a resource. `offering_type`
