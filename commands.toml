@@ -211,3 +211,14 @@ about = "Browse offerings and provision resources of any offering type"
     get = "marketplace_resources_retrieve"
     [group.resource.order]
     # no offering_type -> generic provision (free-form attributes)
+
+  # get-only: an order's uuid is what `provision --no-wait` prints, and this
+  # is the direct way to check on (or `wait` for) it afterwards, rather than
+  # only being able to poll a resource that a still-pending order may not
+  # have created yet.
+  [[group.resource]]
+  name = "order"
+  about = "Marketplace orders (check status of a submitted provision/terminate)"
+  columns = ["uuid", "state", "resource_uuid", "error_message"]
+    [group.resource.commands]
+    get = "marketplace_orders_retrieve"

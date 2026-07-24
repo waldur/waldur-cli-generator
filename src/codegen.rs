@@ -646,6 +646,68 @@ fn generate_resource_module(
         });
     }
 
+    // `wait`: generic polling for any resource with a `get` -- Waldur's API
+    // has no server-side watch/push mechanism, so this is a client-side poll
+    // that stops as soon as a --jmespath condition against the fetched
+    // object is met, or errors on timeout (mirrors AWS's named waiters /
+    // Azure's `az resource wait --custom` / kubectl's `--for=jsonpath=`,
+    // generalized via the JMESPath engine already embedded for --jmespath).
+    // Not tied to a distinct operationId -- it reuses `get`'s own path --
+    // so it's added here rather than through the per-verb KNOWN_VERBS loop.
+    if let Some(get_method_name) = resource.commands.get("get") {
+        let get_op = operations.get(get_method_name).with_context(|| {
+            format!(
+                "internal error: operation `{get_method_name}` (resource `{}`, verb `get`) \
+                 was not extracted",
+                resource.name
+            )
+        })?;
+        let path_param = get_op.path_param.as_deref().with_context(|| {
+            format!(
+                "resource `{}`: `get` has no path parameter -- `wait` needs one to know \
+                 which resource to poll",
+                resource.name
+            )
+        })?;
+        let uuid_ident = field_ident(path_param);
+        let path_expr = build_path_expr(get_op)?;
+        let wait_args = format_ident!("{}WaitArgs", resource_pascal);
+        let wait_about = format!("Wait for a --jmespath condition on {}", resource.about.to_lowercase());
+
+        verb_variants.push(quote! {
+            #[doc = #wait_about]
+            Wait(#wait_args),
+        });
+
+        verb_arms.push(quote! {
+            #resource_enum_ident::Wait(args) => {
+                let path = #path_expr;
+                crate::wait::wait_for(base_url, token, &path, &args.jmespath, args.timeout, args.interval, COLUMNS, format).await?;
+            }
+        });
+
+        ARGS_STRUCTS.with(|cell| {
+            cell.borrow_mut().push(quote! {
+                #[derive(clap::Args, Debug)]
+                pub struct #wait_args {
+                    pub #uuid_ident: String,
+                    /// JMESPath condition to poll for, evaluated against the
+                    /// fetched object on every poll (e.g. "state=='OK'").
+                    /// Waiting stops as soon as this evaluates to anything
+                    /// other than false or null.
+                    #[arg(long)]
+                    pub jmespath: String,
+                    /// Seconds to wait for the condition before giving up.
+                    #[arg(long, default_value_t = 600)]
+                    pub timeout: u64,
+                    /// Seconds between polls.
+                    #[arg(long, default_value_t = 3)]
+                    pub interval: u64,
+                }
+            });
+        });
+    }
+
     let args_structs = ARGS_STRUCTS.with(|cell| {
         let v = cell.borrow().clone();
         cell.borrow_mut().clear();
