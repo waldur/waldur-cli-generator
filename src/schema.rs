@@ -1,8 +1,7 @@
-//! Direct OpenAPI-schema extraction, replacing the old syn-based reading of
-//! rs-client's generated Rust source. The schema is the actual source of
+//! Direct OpenAPI-schema extraction. The schema is the actual source of
 //! truth for every operation's path, params, and request/response shape --
-//! rs-client's generated code was always just an indirect (and sometimes
-//! lossy) proxy for it.
+//! everything waldur-cli's generated commands need is read from it directly,
+//! not proxied through a separately-generated intermediate.
 
 use anyhow::{bail, Context, Result};
 use serde::Deserialize;
@@ -370,10 +369,8 @@ pub fn build_order_skeleton(doc: &OpenApiDoc, offering_type: Option<&str>) -> Re
 
 /// Builds a self-contained JSON Schema (every `$ref` inlined, no external
 /// lookups needed at runtime) for `schema_name`, for `waldur-cli` to validate
-/// `--request` bodies against directly -- replacing the old approach of
-/// deserializing into an rs-client-generated Rust struct purely to check
-/// shape. Embedded as a `const` in generated code, the same way
-/// `build_request_skeleton`'s output is.
+/// `--request` bodies against directly. Embedded as a `const` in generated
+/// code, the same way `build_request_skeleton`'s output is.
 pub fn build_request_json_schema(doc: &OpenApiDoc, schema_name: &str) -> Result<String> {
     let schema = doc
         .components
@@ -563,11 +560,12 @@ fn skeleton_value(
                         continue;
                     }
                     // Required fields get a real typed placeholder; optional
-                    // ones are left `null`. Every optional field in these
-                    // request schemas is an `Option<T>` in rs-client, so a raw
-                    // skeleton deserializes cleanly (null -> None) and passes
-                    // the create/update `--request` type check as-is -- a
-                    // typed empty placeholder like "" would instead fail
+                    // ones are left `null`. A raw skeleton still passes
+                    // request-body validation as-is: waldur-cli's load_body
+                    // strips null-valued keys before validating, so an
+                    // untouched optional field reads as "absent," which the
+                    // JSON Schema's `required` list never complains about --
+                    // a typed empty placeholder like "" would instead fail
                     // against strict field types (dates, numbers). The user
                     // fills in whichever optional fields they actually want.
                     let value = if required.contains(name.as_str()) {

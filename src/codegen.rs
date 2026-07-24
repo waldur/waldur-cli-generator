@@ -76,8 +76,8 @@ fn http_method_expr(op: &ExtractedOperation) -> Result<TokenStream> {
 
 /// Builds the expression for the request path at generation time, splitting
 /// the schema's literal path template (e.g. `/api/customers/{uuid}/`) around
-/// its path parameter, if it has one -- mirrors rs-client's own generated
-/// style rather than substituting at runtime.
+/// its path parameter, if it has one -- resolved once here rather than
+/// re-parsing the template at runtime on every call.
 fn build_path_expr(op: &ExtractedOperation) -> Result<TokenStream> {
     match &op.path_param {
         Some(param_name) => {
@@ -321,8 +321,7 @@ fn generate_resource_module(
             let const_ident = format_ident!("{}_SKELETON", verb.to_uppercase());
             skeleton_consts.push(quote! { const #const_ident: &str = #skeleton; });
             // Embed the JSON Schema `--request` is validated against at
-            // runtime (crate::request::validate_request_body), replacing the
-            // old rs-client-typed-struct deserialize-to-validate approach.
+            // runtime (crate::request::validate_request_body).
             let json_schema = request_json_schemas.get(type_name).with_context(|| {
                 format!("internal error: no JSON schema built for request type `{type_name}`")
             })?;

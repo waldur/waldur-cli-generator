@@ -3,7 +3,7 @@ name = "waldur-cli-generator"
 version = "0.1.0"
 edition = "2021"
 license = "MIT"
-description = "Generates waldur-cli's command surface by parsing rs-client's generated methods"
+description = "Generates waldur-cli's command surface by parsing Waldur's OpenAPI schema"
 publish = false
 
 [[bin]]

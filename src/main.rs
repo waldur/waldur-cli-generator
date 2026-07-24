@@ -82,11 +82,10 @@ fn main() -> Result<()> {
 
     // Build a self-contained JSON Schema for every request-body type, so
     // codegen can embed it for waldur-cli to validate `--request` bodies
-    // against at runtime -- replacing the old approach of deserializing into
-    // an rs-client-generated Rust struct purely to check shape (schema drift
-    // between rs-client's own last regen and the live API could make that
-    // reject valid input or accept invalid input; validating against this
-    // exact schema removes that risk). Keyed the same way as the skeletons.
+    // against at runtime -- the exact same schema every other part of the
+    // CLI (skeletons, --filter/--fields) is already generated from, so a
+    // request-body validation can never drift out of sync with it. Keyed
+    // the same way as the skeletons.
     let mut request_json_schemas: HashMap<String, String> = HashMap::new();
     for op in operations.values() {
         let Some(type_name) = &op.request_body_type else { continue };

@@ -38,8 +38,8 @@ Generate CLI:
     # exactly what broke .fetch-openapi-schema's internal-API path earlier.
     - git clone "https://gitlab-ci-token:${GITLAB_TOKEN}@${CI_SERVER_HOST}/waldur/waldur-cli.git" ../waldur-cli
     # waldur-openapi-schema.yaml is downloaded automatically from needs --
-    # the sole source of truth for command generation now, no rs-client
-    # checkout involved at all.
+    # the sole source of truth for command generation, no other checkout
+    # involved at all.
     - cargo run --release -- waldur-openapi-schema.yaml ../waldur-cli
     - cd ../waldur-cli
     - |
