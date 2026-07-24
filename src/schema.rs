@@ -585,3 +585,656 @@ fn skeleton_value(
         _ => Value::Null,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn doc(yaml: &str) -> OpenApiDoc {
+        serde_yaml::from_str(yaml).expect("test fixture YAML should parse")
+    }
+
+    fn param(schema_type: &str, required: bool) -> RawParameter {
+        RawParameter {
+            name: "x".to_string(),
+            location: "query".to_string(),
+            required,
+            schema: RawSchema { schema_type: Some(schema_type.to_string()), ..Default::default() },
+        }
+    }
+
+    // -- classify_param -------------------------------------------------
+
+    #[test]
+    fn classify_param_maps_scalar_types() {
+        assert!(matches!(classify_param(&param("string", true)), ParamKind::RequiredStr));
+        assert!(matches!(classify_param(&param("string", false)), ParamKind::OptionalStr));
+        assert!(matches!(classify_param(&param("boolean", true)), ParamKind::RequiredBool));
+        assert!(matches!(classify_param(&param("boolean", false)), ParamKind::OptionalBool));
+        assert!(matches!(classify_param(&param("integer", true)), ParamKind::RequiredI64));
+        assert!(matches!(classify_param(&param("integer", false)), ParamKind::OptionalI64));
+    }
+
+    #[test]
+    fn classify_param_treats_array_as_str_since_filter_repeats_the_key() {
+        assert!(matches!(classify_param(&param("array", true)), ParamKind::RequiredStr));
+        assert!(matches!(classify_param(&param("array", false)), ParamKind::OptionalStr));
+    }
+
+    #[test]
+    fn classify_param_skips_unrecognized_types() {
+        assert!(matches!(classify_param(&param("object", true)), ParamKind::SkippedRequired));
+        assert!(matches!(classify_param(&param("object", false)), ParamKind::SkippedOptional));
+    }
+
+    // -- resolve_param ----------------------------------------------------
+
+    #[test]
+    fn resolve_param_finds_a_shared_component_parameter() {
+        let d = doc(
+            r#"
+paths: {}
+components:
+  parameters:
+    Page:
+      name: page
+      in: query
+      schema:
+        type: integer
+  schemas: {}
+"#,
+        );
+        let resolved = resolve_param(&d, "#/components/parameters/Page").unwrap();
+        assert_eq!(resolved.name, "page");
+    }
+
+    #[test]
+    fn resolve_param_rejects_unsupported_ref_shape() {
+        let d = doc("paths: {}\ncomponents: {}\n");
+        let err = resolve_param(&d, "#/definitions/Page").unwrap_err();
+        assert!(err.to_string().contains("unsupported parameter $ref shape"));
+    }
+
+    #[test]
+    fn resolve_param_errors_on_unknown_name() {
+        let d = doc("paths: {}\ncomponents: {}\n");
+        let err = resolve_param(&d, "#/components/parameters/Nope").unwrap_err();
+        assert!(err.to_string().contains("does not resolve to a known parameter"));
+    }
+
+    // -- extract_operation --------------------------------------------------
+
+    #[test]
+    fn extract_operation_full_shape() {
+        let d = doc(
+            r#"
+paths:
+  /api/things/{uuid}/:
+    get:
+      operationId: things_retrieve
+      parameters:
+        - name: uuid
+          in: path
+          required: true
+          schema: {type: string}
+        - $ref: '#/components/parameters/Page'
+        - $ref: '#/components/parameters/PageSize'
+        - name: name
+          in: query
+          required: false
+          schema: {type: string}
+        - name: field
+          in: query
+          required: false
+          schema:
+            type: array
+            items:
+              $ref: '#/components/schemas/ThingFieldEnum'
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ThingRequest'
+components:
+  parameters:
+    Page:
+      name: page
+      in: query
+      schema: {type: integer}
+    PageSize:
+      name: page_size
+      in: query
+      schema: {type: integer}
+  schemas:
+    ThingFieldEnum:
+      type: string
+      enum: [uuid, name]
+    ThingRequest:
+      type: object
+      properties:
+        name: {type: string}
+"#,
+        );
+        let op = extract_operation(&d, "things_retrieve").unwrap();
+        assert_eq!(op.path, "/api/things/{uuid}/");
+        assert_eq!(op.http_verb, "get");
+        assert_eq!(op.path_param.as_deref(), Some("uuid"));
+        // page/page_size (resolved via $ref) are filtered out; field is
+        // pulled into field_enum_name separately -- only "name" remains.
+        assert_eq!(op.query_params.len(), 1);
+        assert_eq!(op.query_params[0].name, "name");
+        assert_eq!(op.field_enum_name.as_deref(), Some("ThingFieldEnum"));
+        assert_eq!(op.request_body_type.as_deref(), Some("ThingRequest"));
+    }
+
+    #[test]
+    fn extract_operation_bails_on_multiple_path_params() {
+        let d = doc(
+            r#"
+paths:
+  /api/things/{a}/{b}/:
+    get:
+      operationId: multi_path
+      parameters:
+        - {name: a, in: path, required: true, schema: {type: string}}
+        - {name: b, in: path, required: true, schema: {type: string}}
+components: {}
+"#,
+        );
+        let err = extract_operation(&d, "multi_path").unwrap_err();
+        assert!(err.to_string().contains("more than one"));
+    }
+
+    #[test]
+    fn extract_operation_not_found_is_a_clear_error() {
+        let d = doc("paths: {}\ncomponents: {}\n");
+        let err = extract_operation(&d, "nope").unwrap_err();
+        assert!(err.to_string().contains("not found in OpenAPI schema"));
+    }
+
+    #[test]
+    fn extract_operation_without_request_body_or_path_param_has_none() {
+        let d = doc(
+            r#"
+paths:
+  /api/things/:
+    get:
+      operationId: things_list
+components: {}
+"#,
+        );
+        let op = extract_operation(&d, "things_list").unwrap();
+        assert_eq!(op.request_body_type, None);
+        assert_eq!(op.path_param, None);
+        assert!(op.query_params.is_empty());
+    }
+
+    // -- extract_enum_values ------------------------------------------------
+
+    #[test]
+    fn extract_enum_values_returns_the_list() {
+        let d = doc(
+            r#"
+paths: {}
+components:
+  schemas:
+    Color:
+      type: string
+      enum: [red, green, blue]
+"#,
+        );
+        assert_eq!(extract_enum_values(&d, "Color").unwrap(), vec!["red", "green", "blue"]);
+    }
+
+    #[test]
+    fn extract_enum_values_errors_when_schema_has_no_enum() {
+        let d = doc(
+            r#"
+paths: {}
+components:
+  schemas:
+    Plain:
+      type: string
+"#,
+        );
+        let err = extract_enum_values(&d, "Plain").unwrap_err();
+        assert!(err.to_string().contains("has no `enum` values"));
+    }
+
+    #[test]
+    fn extract_enum_values_errors_when_schema_not_found() {
+        let d = doc("paths: {}\ncomponents: {}\n");
+        let err = extract_enum_values(&d, "Nope").unwrap_err();
+        assert!(err.to_string().contains("not found in OpenAPI schema"));
+    }
+
+    // -- skeleton_value / build_request_skeleton -----------------------------
+
+    #[test]
+    fn skeleton_required_field_gets_typed_placeholder_optional_gets_null() {
+        let d = doc(
+            r#"
+paths: {}
+components:
+  schemas:
+    Thing:
+      type: object
+      required: [name]
+      properties:
+        name: {type: string}
+        age: {type: integer}
+        active: {type: boolean}
+"#,
+        );
+        let json = build_request_skeleton(&d, "Thing").unwrap();
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(value["name"], serde_json::json!(""));
+        assert_eq!(value["age"], serde_json::Value::Null);
+        assert_eq!(value["active"], serde_json::Value::Null);
+    }
+
+    #[test]
+    fn skeleton_array_field_has_one_sample_element() {
+        let d = doc(
+            r#"
+paths: {}
+components:
+  schemas:
+    Thing:
+      type: object
+      required: [tags]
+      properties:
+        tags:
+          type: array
+          items: {type: string}
+"#,
+        );
+        let json = build_request_skeleton(&d, "Thing").unwrap();
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(value["tags"], serde_json::json!([""]));
+    }
+
+    #[test]
+    fn skeleton_enum_field_uses_first_value() {
+        let d = doc(
+            r#"
+paths: {}
+components:
+  schemas:
+    Thing:
+      type: object
+      required: [color]
+      properties:
+        color:
+          type: string
+          enum: [red, green]
+"#,
+        );
+        let json = build_request_skeleton(&d, "Thing").unwrap();
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(value["color"], serde_json::json!("red"));
+    }
+
+    #[test]
+    fn skeleton_ref_field_resolves_and_recurses() {
+        let d = doc(
+            r#"
+paths: {}
+components:
+  schemas:
+    Thing:
+      type: object
+      required: [owner]
+      properties:
+        owner:
+          $ref: '#/components/schemas/Owner'
+    Owner:
+      type: object
+      required: [name]
+      properties:
+        name: {type: string}
+"#,
+        );
+        let json = build_request_skeleton(&d, "Thing").unwrap();
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(value["owner"]["name"], serde_json::json!(""));
+    }
+
+    #[test]
+    fn skeleton_allof_wrapping_a_ref_takes_that_member() {
+        let d = doc(
+            r#"
+paths: {}
+components:
+  schemas:
+    Thing:
+      type: object
+      required: [status]
+      properties:
+        status:
+          allOf:
+            - $ref: '#/components/schemas/Status'
+          description: "wrapped for a sibling description, drf-spectacular style"
+    Status:
+      type: string
+      enum: [active, inactive]
+"#,
+        );
+        let json = build_request_skeleton(&d, "Thing").unwrap();
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(value["status"], serde_json::json!("active"));
+    }
+
+    #[test]
+    fn skeleton_read_only_field_is_excluded_entirely() {
+        let d = doc(
+            r#"
+paths: {}
+components:
+  schemas:
+    Thing:
+      type: object
+      required: [name]
+      properties:
+        name: {type: string}
+        uuid: {type: string, readOnly: true}
+"#,
+        );
+        let json = build_request_skeleton(&d, "Thing").unwrap();
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert!(value.get("uuid").is_none());
+    }
+
+    #[test]
+    fn skeleton_self_referential_ref_stops_at_the_cycle() {
+        let d = doc(
+            r#"
+paths: {}
+components:
+  schemas:
+    Node:
+      type: object
+      required: [parent]
+      properties:
+        parent:
+          $ref: '#/components/schemas/Node'
+"#,
+        );
+        // The real assertion is that this returns at all (proving the `seen`
+        // cycle guard works) rather than recursing until the depth cutoff on
+        // every test run.
+        let json = build_request_skeleton(&d, "Node").unwrap();
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(value["parent"], serde_json::Value::Null);
+    }
+
+    #[test]
+    fn skeleton_depth_cutoff_returns_null() {
+        let d = doc("paths: {}\ncomponents: {}\n");
+        let schema = RawSchema { schema_type: Some("string".to_string()), ..Default::default() };
+        let mut seen = std::collections::HashSet::new();
+        let value = skeleton_value(&d, &schema, &mut seen, SKELETON_MAX_DEPTH + 1);
+        assert_eq!(value, serde_json::Value::Null);
+    }
+
+    // -- build_order_skeleton ------------------------------------------------
+
+    #[test]
+    fn order_skeleton_typed_offering_uses_the_naming_convention() {
+        let d = doc(
+            r#"
+paths: {}
+components:
+  schemas:
+    OrderCreateRequest:
+      type: object
+      properties:
+        offering: {type: string}
+    OpenStackInstanceCreateOrderAttributes:
+      type: object
+      required: [name]
+      properties:
+        name: {type: string}
+"#,
+        );
+        let json = build_order_skeleton(&d, Some("OpenStack.Instance")).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(value["attributes"]["name"], serde_json::json!(""));
+        assert_eq!(value["accepting_terms_of_service"], serde_json::json!(true));
+    }
+
+    #[test]
+    fn order_skeleton_generic_uses_generic_attributes() {
+        let d = doc(
+            r#"
+paths: {}
+components:
+  schemas:
+    OrderCreateRequest:
+      type: object
+      properties: {}
+    GenericOrderAttributes:
+      type: object
+      required: [name]
+      properties:
+        name: {type: string}
+"#,
+        );
+        let json = build_order_skeleton(&d, None).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(value["attributes"]["name"], serde_json::json!(""));
+    }
+
+    #[test]
+    fn order_skeleton_missing_attrs_schema_is_a_clear_error() {
+        let d = doc(
+            r#"
+paths: {}
+components:
+  schemas:
+    OrderCreateRequest:
+      type: object
+      properties: {}
+"#,
+        );
+        let err = build_order_skeleton(&d, Some("Nonexistent.Type")).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("attributes schema"));
+        assert!(msg.contains("NonexistentType"));
+    }
+
+    // -- json_schema_value / build_request_json_schema -----------------------
+
+    #[test]
+    fn json_schema_required_field_appears_in_properties_and_required() {
+        let d = doc(
+            r#"
+paths: {}
+components:
+  schemas:
+    Thing:
+      type: object
+      required: [name]
+      properties:
+        name: {type: string}
+        age: {type: integer}
+"#,
+        );
+        let json = build_request_json_schema(&d, "Thing").unwrap();
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(value["properties"]["name"], serde_json::json!({"type": "string"}));
+        assert_eq!(value["properties"]["age"], serde_json::json!({"type": "integer"}));
+        assert_eq!(value["required"], serde_json::json!(["name"]));
+    }
+
+    #[test]
+    fn json_schema_format_is_preserved() {
+        let d = doc(
+            r#"
+paths: {}
+components:
+  schemas:
+    Thing:
+      type: object
+      properties:
+        created:
+          type: string
+          format: date-time
+"#,
+        );
+        let json = build_request_json_schema(&d, "Thing").unwrap();
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            value["properties"]["created"],
+            serde_json::json!({"type": "string", "format": "date-time"})
+        );
+    }
+
+    #[test]
+    fn json_schema_read_only_field_excluded_from_properties_and_required() {
+        let d = doc(
+            r#"
+paths: {}
+components:
+  schemas:
+    Thing:
+      type: object
+      required: [uuid, name]
+      properties:
+        uuid: {type: string, readOnly: true}
+        name: {type: string}
+"#,
+        );
+        let json = build_request_json_schema(&d, "Thing").unwrap();
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert!(value["properties"].get("uuid").is_none());
+        // uuid was in the schema's own `required` list -- dropping the
+        // read-only property without also filtering `required` would leave
+        // the schema demanding a field it no longer describes at all,
+        // rejecting every request.
+        assert_eq!(value["required"], serde_json::json!(["name"]));
+    }
+
+    #[test]
+    fn json_schema_preserves_every_allof_member_not_just_the_first() {
+        let d = doc(
+            r#"
+paths: {}
+components:
+  schemas:
+    Thing:
+      allOf:
+        - $ref: '#/components/schemas/Base'
+        - $ref: '#/components/schemas/Extra'
+    Base:
+      type: object
+      properties:
+        name: {type: string}
+    Extra:
+      type: object
+      properties:
+        age: {type: integer}
+"#,
+        );
+        let json = build_request_json_schema(&d, "Thing").unwrap();
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let members = value["allOf"].as_array().unwrap();
+        assert_eq!(members.len(), 2, "skeleton_value would take only the first member -- json schema must keep both");
+        assert_eq!(members[0]["properties"]["name"], serde_json::json!({"type": "string"}));
+        assert_eq!(members[1]["properties"]["age"], serde_json::json!({"type": "integer"}));
+    }
+
+    #[test]
+    fn json_schema_enum_field() {
+        let d = doc(
+            r#"
+paths: {}
+components:
+  schemas:
+    Thing:
+      type: object
+      properties:
+        color:
+          type: string
+          enum: [red, green]
+"#,
+        );
+        let json = build_request_json_schema(&d, "Thing").unwrap();
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(value["properties"]["color"], serde_json::json!({"enum": ["red", "green"]}));
+    }
+
+    #[test]
+    fn json_schema_self_referential_ref_becomes_permissive_true() {
+        let d = doc(
+            r#"
+paths: {}
+components:
+  schemas:
+    Node:
+      type: object
+      properties:
+        parent:
+          $ref: '#/components/schemas/Node'
+"#,
+        );
+        let json = build_request_json_schema(&d, "Node").unwrap();
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        // Unlike skeleton_value's Null, a cycle here must stay a *valid*
+        // schema node -- JSON Schema's `true` means "anything passes," so
+        // validation doesn't reject legitimately recursive data it can't
+        // fully describe.
+        assert_eq!(value["properties"]["parent"], serde_json::json!(true));
+    }
+
+    #[test]
+    fn json_schema_depth_cutoff_is_permissive_true_not_null() {
+        let d = doc("paths: {}\ncomponents: {}\n");
+        let schema = RawSchema { schema_type: Some("string".to_string()), ..Default::default() };
+        let mut seen = std::collections::HashSet::new();
+        let value = json_schema_value(&d, &schema, &mut seen, SKELETON_MAX_DEPTH + 1);
+        assert_eq!(value, serde_json::Value::Bool(true));
+    }
+
+    #[test]
+    fn json_schema_array_field() {
+        let d = doc(
+            r#"
+paths: {}
+components:
+  schemas:
+    Thing:
+      type: object
+      properties:
+        tags:
+          type: array
+          items: {type: string}
+"#,
+        );
+        let json = build_request_json_schema(&d, "Thing").unwrap();
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            value["properties"]["tags"],
+            serde_json::json!({"type": "array", "items": {"type": "string"}})
+        );
+    }
+
+    #[test]
+    fn json_schema_object_without_properties_is_a_permissive_object() {
+        let d = doc(
+            r#"
+paths: {}
+components:
+  schemas:
+    Thing:
+      type: object
+      properties:
+        metadata:
+          type: object
+"#,
+        );
+        let json = build_request_json_schema(&d, "Thing").unwrap();
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(value["properties"]["metadata"], serde_json::json!({"type": "object"}));
+    }
+}

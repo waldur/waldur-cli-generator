@@ -6,6 +6,26 @@ stages:
   - test
   - generate
 
+Build:
+  stage: test
+  image: registry.hpc.ut.ee/mirror/library/rust:1.88-bookworm
+  cache:
+    key: cargo
+    paths:
+      - .cargo/registry
+  variables:
+    CARGO_HOME: "$CI_PROJECT_DIR/.cargo"
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+    - if: '$CI_COMMIT_BRANCH == "main"'
+  before_script:
+    # The rust:bookworm image doesn't ship clippy by default.
+    - rustup component add clippy
+  script:
+    - cargo build --locked
+    - cargo test --locked
+    - cargo clippy --all-targets
+
 Fetch OpenAPI schema:
   extends: .fetch-openapi-schema
 

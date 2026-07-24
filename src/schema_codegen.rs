@@ -476,3 +476,160 @@ fn capitalize(s: &str) -> String {
         None => String::new(),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::manifest::{Group, OrderConfig, Resource};
+    use crate::schema::ExtractedParam;
+
+    fn op(path: &str, verb: &str, path_param: Option<&str>, request_body_type: Option<&str>) -> ExtractedOperation {
+        ExtractedOperation {
+            operation_id: format!("{verb}_op"),
+            path: path.to_string(),
+            http_verb: verb.to_string(),
+            path_param: path_param.map(str::to_string),
+            query_params: vec![ExtractedParam { name: "name".to_string(), kind: ParamKind::OptionalStr }],
+            field_enum_name: None,
+            request_body_type: request_body_type.map(str::to_string),
+        }
+    }
+
+    fn resource(name: &str, commands: &[(&str, &str)], order: Option<OrderConfig>) -> Resource {
+        Resource {
+            name: name.to_string(),
+            about: format!("{name}s"),
+            columns: vec!["uuid".to_string(), "name".to_string()],
+            commands: commands.iter().map(|(v, m)| (v.to_string(), m.to_string())).collect(),
+            order,
+        }
+    }
+
+    // -- filter_kind_str / capitalize --------------------------------------
+
+    #[test]
+    fn filter_kind_str_maps_scalar_kinds_and_drops_skipped() {
+        assert_eq!(filter_kind_str(&ParamKind::RequiredStr), Some("string"));
+        assert_eq!(filter_kind_str(&ParamKind::OptionalBool), Some("boolean"));
+        assert_eq!(filter_kind_str(&ParamKind::RequiredI64), Some("integer"));
+        assert_eq!(filter_kind_str(&ParamKind::SkippedOptional), None);
+        assert_eq!(filter_kind_str(&ParamKind::SkippedRequired), None);
+    }
+
+    #[test]
+    fn capitalize_first_letter_only() {
+        assert_eq!(capitalize("list"), "List");
+        assert_eq!(capitalize(""), "");
+        assert_eq!(capitalize("Already"), "Already");
+    }
+
+    // -- build_schema_json --------------------------------------------------
+
+    #[test]
+    fn build_schema_json_shape() {
+        let manifest = Manifest {
+            group: vec![Group {
+                name: "team".to_string(),
+                about: "Team management".to_string(),
+                resource: vec![
+                    resource("customer", &[("list", "customers_list"), ("get", "customers_get"), ("create", "customers_create")], None),
+                    resource("tenant", &[("get", "tenants_get")], Some(OrderConfig { offering_type: None })),
+                ],
+            }],
+        };
+
+        let mut operations = HashMap::new();
+        operations.insert("customers_list".to_string(), op("/api/customers/", "get", None, None));
+        operations.insert("customers_get".to_string(), op("/api/customers/{uuid}/", "get", Some("uuid"), None));
+        operations.insert(
+            "customers_create".to_string(),
+            op("/api/customers/", "post", None, Some("CustomerRequest")),
+        );
+        operations.insert("tenants_get".to_string(), op("/api/tenants/{uuid}/", "get", Some("uuid"), None));
+
+        let field_enum_values = HashMap::new();
+        let mut request_skeletons = HashMap::new();
+        request_skeletons.insert("CustomerRequest".to_string(), r#"{"name": ""}"#.to_string());
+        let mut order_skeletons = HashMap::new();
+        order_skeletons.insert("tenant".to_string(), r#"{"offering": ""}"#.to_string());
+
+        let schema = build_schema_json(&manifest, &operations, &field_enum_values, &request_skeletons, &order_skeletons, "1.2.3").unwrap();
+
+        assert_eq!(schema["version"], json!("1.2.3"));
+
+        let commands = schema["commands"].as_array().unwrap();
+        let find = |path: &[&str]| {
+            commands.iter().find(|c| {
+                let p: Vec<&str> = c["path"].as_array().unwrap().iter().map(|v| v.as_str().unwrap()).collect();
+                p == path
+            })
+        };
+
+        // list: --filter (from the query param), --fields, --jmespath, --limit, --format.
+        let list = find(&["team", "customer", "list"]).expect("list command present");
+        let param_names: Vec<&str> = list["parameters"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|p| p["name"].as_str().unwrap())
+            .collect();
+        assert!(param_names.contains(&"--filter"));
+        assert!(param_names.contains(&"--fields"));
+        assert!(param_names.contains(&"--jmespath"));
+        assert!(param_names.contains(&"--limit"));
+        assert!(param_names.contains(&"--format"));
+        assert_eq!(list["output"]["default_columns"], json!(["uuid", "name"]));
+
+        // get: positional uuid, required.
+        let get = find(&["team", "customer", "get"]).expect("get command present");
+        assert_eq!(get["parameters"][0]["name"], json!("uuid"));
+        assert_eq!(get["parameters"][0]["required"], json!(true));
+
+        // create: request skeleton embedded from the schema-name lookup.
+        let create = find(&["team", "customer", "create"]).expect("create command present");
+        assert_eq!(create["request_skeleton"], json!({"name": ""}));
+
+        // Order-enabled resource gets provision/terminate, embedding the
+        // order skeleton keyed by resource name (not operation id).
+        let provision = find(&["team", "tenant", "provision"]).expect("provision command present");
+        assert_eq!(provision["request_skeleton"], json!({"offering": ""}));
+        find(&["team", "tenant", "terminate"]).expect("terminate command present");
+
+        // Hand-written meta-commands are always present.
+        for path in [["schema"].as_slice(), &["completions"], &["login"], &["logout"], &["whoami"]] {
+            assert!(
+                commands.iter().any(|c| c["path"].as_array().unwrap().iter().map(|v| v.as_str().unwrap()).eq(path.iter().copied())),
+                "missing meta-command {path:?}"
+            );
+        }
+
+        // Groups summary: the order-enabled resource's verb list includes
+        // provision/terminate alongside its declared `get`.
+        let groups = schema["groups"].as_array().unwrap();
+        let team_group = groups.iter().find(|g| g["name"] == "team").unwrap();
+        let tenant_resource = team_group["resources"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["name"] == "tenant")
+            .unwrap();
+        let verbs: Vec<&str> = tenant_resource["verbs"].as_array().unwrap().iter().map(|v| v.as_str().unwrap()).collect();
+        assert!(verbs.contains(&"get"));
+        assert!(verbs.contains(&"provision"));
+        assert!(verbs.contains(&"terminate"));
+    }
+
+    #[test]
+    fn build_schema_json_errors_when_an_operation_is_missing() {
+        let manifest = Manifest {
+            group: vec![Group {
+                name: "team".to_string(),
+                about: "Team management".to_string(),
+                resource: vec![resource("customer", &[("get", "customers_get")], None)],
+            }],
+        };
+        let operations = HashMap::new(); // customers_get was never extracted
+        let err = build_schema_json(&manifest, &operations, &HashMap::new(), &HashMap::new(), &HashMap::new(), "0.0.0").unwrap_err();
+        assert!(err.to_string().contains("customers_get"));
+    }
+}

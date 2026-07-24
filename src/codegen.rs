@@ -1254,4 +1254,121 @@ mod tests {
         assert!(rendered(&emitted.arm).contains("crate :: order :: provision"));
         assert!(rendered(&emitted.arm).contains("crate :: order :: terminate"));
     }
+
+    // -- small free functions -------------------------------------------
+
+    #[test]
+    fn pascal_case_handles_hyphen_underscore_and_plain_words() {
+        assert_eq!(pascal_case("customer"), "Customer");
+        assert_eq!(pascal_case("user-invitation"), "UserInvitation");
+        assert_eq!(pascal_case("organization_group"), "OrganizationGroup");
+        assert_eq!(pascal_case("get"), "Get");
+    }
+
+    #[test]
+    fn snake_ident_replaces_hyphens() {
+        assert_eq!(snake_ident("user-invitation").to_string(), "user_invitation");
+        assert_eq!(snake_ident("customer").to_string(), "customer");
+    }
+
+    #[test]
+    fn field_ident_passes_through_plain_names() {
+        assert_eq!(field_ident("uuid").to_string(), "uuid");
+        assert_eq!(field_ident("name_exact").to_string(), "name_exact");
+    }
+
+    #[test]
+    fn field_ident_raw_escapes_keyword_collisions() {
+        // Waldur's own `type` filter param is exactly why this exists.
+        assert_eq!(field_ident("type").to_string(), "r#type");
+    }
+
+    #[test]
+    fn filter_kind_expr_maps_scalar_kinds() {
+        let str_param = ExtractedParam { name: "name".to_string(), kind: ParamKind::OptionalStr };
+        assert!(filter_kind_expr(&str_param).unwrap().unwrap().to_string().contains("Str"));
+
+        let bool_param = ExtractedParam { name: "archived".to_string(), kind: ParamKind::RequiredBool };
+        assert!(filter_kind_expr(&bool_param).unwrap().unwrap().to_string().contains("Bool"));
+
+        let int_param = ExtractedParam { name: "age".to_string(), kind: ParamKind::OptionalI64 };
+        assert!(filter_kind_expr(&int_param).unwrap().unwrap().to_string().contains("I64"));
+    }
+
+    #[test]
+    fn filter_kind_expr_skipped_optional_is_silently_dropped() {
+        let param = ExtractedParam { name: "weird".to_string(), kind: ParamKind::SkippedOptional };
+        assert!(filter_kind_expr(&param).unwrap().is_none());
+    }
+
+    #[test]
+    fn filter_kind_expr_skipped_required_is_a_hard_error() {
+        // Silently dropping a *required* filter would mean --help never
+        // shows it, but the server still expects it -- must fail loudly at
+        // generation time instead.
+        let param = ExtractedParam { name: "weird".to_string(), kind: ParamKind::SkippedRequired };
+        let err = filter_kind_expr(&param).unwrap_err();
+        assert!(err.to_string().contains("weird"));
+    }
+
+    #[test]
+    fn http_method_expr_maps_known_verbs() {
+        for (verb, expected) in [
+            ("get", "GET"),
+            ("post", "POST"),
+            ("put", "PUT"),
+            ("patch", "PATCH"),
+            ("delete", "DELETE"),
+        ] {
+            let op = op("/api/things/", verb, None);
+            assert!(rendered(&http_method_expr(&op).unwrap()).contains(expected));
+        }
+    }
+
+    #[test]
+    fn http_method_expr_rejects_unknown_verbs() {
+        let op = op("/api/things/", "options", None);
+        let err = http_method_expr(&op).unwrap_err();
+        assert!(err.to_string().contains("options"));
+    }
+
+    #[test]
+    fn build_path_expr_with_and_without_a_path_param() {
+        let with_param = op("/api/things/{uuid}/", "get", Some("uuid"));
+        let rendered_with = rendered(&build_path_expr(&with_param).unwrap());
+        assert!(rendered_with.contains("args . uuid"));
+        assert!(rendered_with.contains("\"/api/things/\""));
+        assert!(rendered_with.contains("\"/\""));
+
+        let without_param = op("/api/things/", "get", None);
+        let rendered_without = rendered(&build_path_expr(&without_param).unwrap());
+        assert!(rendered_without.contains("\"/api/things/\" . to_string ()"));
+    }
+
+    #[test]
+    fn build_path_expr_bails_when_path_lacks_its_own_placeholder() {
+        // Path param name doesn't match the `{...}` in the literal path --
+        // an internal inconsistency in the schema this generator can't
+        // silently paper over.
+        let mut op = op("/api/things/{uuid}/", "get", Some("id"));
+        op.path = "/api/things/{uuid}/".to_string();
+        let err = build_path_expr(&op).unwrap_err();
+        assert!(err.to_string().contains("doesn't contain its own path param"));
+    }
+
+    #[test]
+    fn body_path_stmts_update_unwraps_the_optional_uuid_with_context() {
+        let op = op("/api/things/{uuid}/", "put", Some("uuid"));
+        let rendered = rendered(&body_path_stmts(&op).unwrap());
+        assert!(rendered.contains("as_deref () . context"));
+        assert!(rendered.contains("requires a <uuid> argument"));
+    }
+
+    #[test]
+    fn body_path_stmts_create_has_no_uuid_unwrap() {
+        let op = op("/api/things/", "post", None);
+        let rendered = rendered(&body_path_stmts(&op).unwrap());
+        assert!(!rendered.contains("context"));
+        assert!(rendered.contains("\"/api/things/\" . to_string ()"));
+    }
 }
