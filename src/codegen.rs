@@ -401,27 +401,46 @@ fn generate_resource_module(
                         }
                     }
                 }
-                let result = crate::pagination::fetch_all(base_url, token, #path, &query_params, args.limit).await?;
-                // table/tsv render exactly these columns (json/toon ignore
-                // them, showing the complete fetched object regardless) --
-                // when --fields narrowed what was actually fetched, the
-                // display columns have to follow the same override, or
-                // table/tsv would show a column for every field COLUMNS
-                // expects but --fields didn't ask for, which the server
-                // response then doesn't have at all (rendering as blank).
-                let display_columns: Vec<&str> = match &args.fields {
-                    Some(fields) => fields.iter().map(String::as_str).collect(),
-                    None => COLUMNS.to_vec(),
-                };
-                // --query reshapes the already-fetched result client-side
-                // (AWS CLI's --query) -- distinct from --filter, which
-                // narrows what's fetched in the first place.
-                let result: serde_json::Value = serde_json::Value::Array(result);
-                let result = match &args.jmespath {
-                    Some(expr) => crate::query::apply(result, expr)?,
-                    None => result,
-                };
-                crate::output::print_result(&result, &display_columns, format)?;
+                // ndjson prints as each page arrives instead of buffering the
+                // complete result set first -- lower memory, faster first
+                // output. Only when there's no --jmespath: a JMESPath
+                // expression can reshape/aggregate across the whole array
+                // (sort, slice, count, ...), so it still needs the complete
+                // result fetched first, same as json/toon/table/tsv.
+                if matches!(format, crate::output::OutputFormat::Ndjson) && args.jmespath.is_none() {
+                    crate::pagination::fetch_all_streaming(
+                        base_url,
+                        token,
+                        #path,
+                        &query_params,
+                        args.limit,
+                        |item| crate::output::print_ndjson_line(&item),
+                    )
+                    .await?;
+                } else {
+                    let result = crate::pagination::fetch_all(base_url, token, #path, &query_params, args.limit).await?;
+                    // table/tsv render exactly these columns (json/toon/ndjson
+                    // ignore them, showing the complete fetched object
+                    // regardless) -- when --fields narrowed what was actually
+                    // fetched, the display columns have to follow the same
+                    // override, or table/tsv would show a column for every
+                    // field COLUMNS expects but --fields didn't ask for,
+                    // which the server response then doesn't have at all
+                    // (rendering as blank).
+                    let display_columns: Vec<&str> = match &args.fields {
+                        Some(fields) => fields.iter().map(String::as_str).collect(),
+                        None => COLUMNS.to_vec(),
+                    };
+                    // --query reshapes the already-fetched result client-side
+                    // (AWS CLI's --query) -- distinct from --filter, which
+                    // narrows what's fetched in the first place.
+                    let result: serde_json::Value = serde_json::Value::Array(result);
+                    let result = match &args.jmespath {
+                        Some(expr) => crate::query::apply(result, expr)?,
+                        None => result,
+                    };
+                    crate::output::print_result(&result, &display_columns, format)?;
+                }
             }
         } else if *verb == "get" {
             let method_expr = http_method_expr(op)?;
@@ -477,7 +496,7 @@ fn generate_resource_module(
                 }
                 let _ = crate::http::call_one(base_url, token, #method_expr, &path, None).await?;
                 match format {
-                    crate::output::OutputFormat::Json => {
+                    crate::output::OutputFormat::Json | crate::output::OutputFormat::Ndjson => {
                         println!("{}", serde_json::json!({"deleted": true, "uuid": args.#uuid_ident}));
                     }
                     crate::output::OutputFormat::Table => {
