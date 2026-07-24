@@ -26,14 +26,17 @@ pub struct Resource {
     pub order: Option<OrderConfig>,
 }
 
-/// Marketplace-order provisioning config for a resource. The `offering_type`
-/// (e.g. `OpenStack.Instance`) both identifies the offering kind and, by
+/// Marketplace-order provisioning config for a resource. `offering_type`
+/// (e.g. `OpenStack.Instance`), when set, both pins the offering kind and, by
 /// Waldur's schema-naming convention (`OpenStackInstanceCreateOrderAttributes`),
 /// locates the typed attributes schema used for `provision`'s
-/// `--generate-skeleton`.
+/// `--generate-skeleton`. Omit it for a generic provisioner that works against
+/// any offering: the skeleton then uses `GenericOrderAttributes` and the
+/// caller supplies the offering-specific attributes themselves.
 #[derive(Debug, Deserialize)]
 pub struct OrderConfig {
-    pub offering_type: String,
+    #[serde(default)]
+    pub offering_type: Option<String>,
 }
 
 /// Verbs we know how to generate CLI handling for. Order here is also the

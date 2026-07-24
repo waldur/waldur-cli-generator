@@ -520,9 +520,9 @@ fn generate_resource_module(
     // `provision` (submit a marketplace order + poll to completion) and
     // `terminate` (terminate the marketplace resource + poll) subcommands,
     // for the async order flow that has no direct REST create/delete.
-    if let Some(order) = &resource.order {
-        let skeleton = order_skeletons.get(&order.offering_type).with_context(|| {
-            format!("internal error: no order skeleton built for `{}`", order.offering_type)
+    if resource.order.is_some() {
+        let skeleton = order_skeletons.get(&resource.name).with_context(|| {
+            format!("internal error: no order skeleton built for resource `{}`", resource.name)
         })?;
         skeleton_consts.push(quote! { const PROVISION_SKELETON: &str = #skeleton; });
 

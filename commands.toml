@@ -187,7 +187,7 @@ about = "Manage team membership and organization access"
 
 [[group]]
 name = "marketplace"
-about = "Browse marketplace offerings (for provisioning via `openstack ... provision`)"
+about = "Browse offerings and provision resources of any offering type"
 
   [[group.resource]]
   name = "offering"
@@ -196,3 +196,18 @@ about = "Browse marketplace offerings (for provisioning via `openstack ... provi
     [group.resource.commands]
     list = "marketplace_public_offerings_list"
     get = "marketplace_public_offerings_retrieve"
+
+  # Generic provisioning for ANY offering type (SLURM, VMware, custom, ...),
+  # not just the typed OpenStack tenant/instance/volume commands. `provision`
+  # takes a free-form `attributes` object (GenericOrderAttributes skeleton),
+  # since the accepted attributes are offering-specific and not all modeled in
+  # the schema; `terminate` works on any marketplace resource by uuid.
+  [[group.resource]]
+  name = "resource"
+  about = "Marketplace resources (provision/terminate any offering)"
+  columns = ["uuid", "name", "offering_name", "state"]
+    [group.resource.commands]
+    list = "marketplace_resources_list"
+    get = "marketplace_resources_retrieve"
+    [group.resource.order]
+    # no offering_type -> generic provision (free-form attributes)

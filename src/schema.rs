@@ -334,18 +334,24 @@ fn skeleton_for(doc: &OpenApiDoc, schema_name: &str) -> Result<serde_json::Value
 }
 
 /// Builds the `--generate-skeleton` template for a `provision` command: the
-/// marketplace `OrderCreateRequest` envelope, but with its free-form
-/// `attributes` object replaced by the typed skeleton for this offering's
+/// marketplace `OrderCreateRequest` envelope, with its polymorphic
+/// `attributes` object replaced by a concrete schema. For a specific
+/// `offering_type` (e.g. `OpenStack.Instance`), that's the typed
 /// `{OfferingType}CreateOrderAttributes` schema (Waldur's naming convention,
-/// e.g. `OpenStack.Instance` -> `OpenStackInstanceCreateOrderAttributes`).
+/// so `OpenStack.Instance` -> `OpenStackInstanceCreateOrderAttributes`). For a
+/// generic provisioner (`offering_type` is `None`), it's `GenericOrderAttributes`
+/// -- the caller supplies the offering-specific attributes themselves.
 /// `accepting_terms_of_service` is defaulted to `true` -- a CLI provision is
 /// an explicit action, and leaving it unset can leave the order stuck pending
 /// consumer approval.
-pub fn build_order_skeleton(doc: &OpenApiDoc, offering_type: &str) -> Result<String> {
+pub fn build_order_skeleton(doc: &OpenApiDoc, offering_type: Option<&str>) -> Result<String> {
     let mut envelope = skeleton_for(doc, "OrderCreateRequest")?;
-    let attrs_schema = format!("{}CreateOrderAttributes", offering_type.replace('.', ""));
+    let attrs_schema = match offering_type {
+        Some(t) => format!("{}CreateOrderAttributes", t.replace('.', "")),
+        None => "GenericOrderAttributes".to_string(),
+    };
     let attributes = skeleton_for(doc, &attrs_schema).with_context(|| {
-        format!("no attributes schema `{attrs_schema}` for offering type `{offering_type}`")
+        format!("no attributes schema `{attrs_schema}` for offering type `{offering_type:?}`")
     })?;
     let obj = envelope
         .as_object_mut()
@@ -353,7 +359,7 @@ pub fn build_order_skeleton(doc: &OpenApiDoc, offering_type: &str) -> Result<Str
     obj.insert("attributes".to_string(), attributes);
     obj.insert("accepting_terms_of_service".to_string(), serde_json::Value::Bool(true));
     serde_json::to_string_pretty(&envelope)
-        .with_context(|| format!("serializing order skeleton for `{offering_type}`"))
+        .with_context(|| format!("serializing order skeleton for `{offering_type:?}`"))
 }
 
 /// A type-appropriate placeholder for one schema node. Mirrors AWS's skeleton
