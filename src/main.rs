@@ -1,5 +1,6 @@
 mod codegen;
 mod manifest;
+mod reference_docs;
 mod schema;
 mod schema_codegen;
 
@@ -213,6 +214,35 @@ fn main() -> Result<()> {
     .context("building CLI schema JSON")?;
     schema_codegen::write_schema_rs(&schema_json, &waldur_cli_dir.join("src"))
         .context("writing schema.rs")?;
+
+    // docs/reference/ is entirely generated output (unlike src/commands/,
+    // nothing hand-written is ever expected there) -- recreate it wholesale
+    // each run so a resource/verb that goes away doesn't leave a stale page
+    // behind, the way src/commands/ needs a manual `git rm` for today.
+    let reference_pages = reference_docs::generate(
+        &manifest,
+        &operations,
+        &field_enum_values,
+        &order_enum_values,
+        &request_skeletons,
+        &request_json_schemas,
+        &order_skeletons,
+        &resource_actions,
+    )
+    .context("generating docs/reference/")?;
+    let reference_dir = waldur_cli_dir.join("docs/reference");
+    if reference_dir.exists() {
+        fs::remove_dir_all(&reference_dir)
+            .with_context(|| format!("clearing {}", reference_dir.display()))?;
+    }
+    for page in &reference_pages {
+        let path = reference_dir.join(&page.relative_path);
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
+        }
+        fs::write(&path, &page.content).with_context(|| format!("writing {}", path.display()))?;
+    }
+    println!("Wrote {} reference page(s) to {}", reference_pages.len(), reference_dir.display());
 
     println!(
         "Generated {} resource(s) across {} group(s), {} operation(s) used.",
