@@ -181,6 +181,22 @@ about = "Manage team membership and organization access"
     [group.resource.commands]
     operation_prefix = "roles"
 
+  # PUT/PATCH don't exist -- tokens are immutable after creation, so there's
+  # no `update` operationId to derive.
+  [[group.resource]]
+  name = "personal-access-token"
+  about = "Personal access tokens (named, scoped, time-limited API credentials)"
+  columns = ["uuid", "name", "token_prefix", "expires_at", "is_active"]
+    [group.resource.commands]
+    operation_prefix = "personal_access_tokens"
+    exclude = ["update"]
+    [group.resource.actions]
+    # `rotate` (POST, bodyless: revokes the old token and creates a new one
+    # with the same name/scopes/expiration) is the only action nested under
+    # this resource's own {uuid}/ path -- available_scopes/
+    # available_binding_targets/count live at the collection level instead,
+    # so discovery never reaches them; no exclude list needed.
+
 [[group]]
 name = "marketplace"
 about = "Browse offerings and provision resources of any offering type"
