@@ -281,6 +281,11 @@ about = "Browse offerings and provision resources of any offering type"
   name = "order"
   about = "Marketplace orders (check status of a submitted provision/terminate)"
   columns = ["uuid", "state", "resource_uuid", "error_message"]
+  # Explicit override: an order has genuinely async state (pending/executing/
+  # done/erred) to poll, but it isn't itself provisioned via a
+  # [group.resource.order] block (it *is* the order) -- see manifest.rs's
+  # `wants_wait` for why that means the default wouldn't catch it.
+  wait = true
     [group.resource.commands]
     operation_prefix = "marketplace_orders"
     exclude = ["list", "create", "update", "delete"]

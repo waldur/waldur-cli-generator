@@ -42,6 +42,29 @@ pub struct Resource {
     /// See `WebConfig`.
     #[serde(default)]
     pub web: Option<WebConfig>,
+    /// Explicit override for whether this resource gets a `wait` verb.
+    /// Absent means "use the default" -- see `wants_wait`. Only
+    /// `marketplace/order` needs this set to `true` explicitly: it's the
+    /// one resource with genuinely async state (`pending`/`executing`/
+    /// `done`/`erred`) that isn't itself provisioned via `[resource.order]`
+    /// (it *is* the order), so the default wouldn't catch it.
+    #[serde(default)]
+    pub wait: Option<bool>,
+}
+
+/// Whether a resource should get a generic `wait` verb (poll until a
+/// `--jmespath` condition against the fetched object is met). Waiting only
+/// makes sense for resources with real async, server-side state to poll --
+/// a plain CRUD resource (a customer, a role, a catalog entry like a
+/// flavor) reaches its final state synchronously on `create`/`update`, so
+/// there's nothing to wait *for*. Defaults to whether the resource is
+/// itself provisioned through the marketplace order flow
+/// (`resource.order.is_some()` -- tenant/instance/volume/the generic
+/// marketplace resource all qualify), overridable per resource via `wait`
+/// in `commands.toml` for the one exception (`marketplace/order`) that
+/// doesn't fit that shape but still needs it.
+pub fn wants_wait(resource: &Resource) -> bool {
+    resource.wait.unwrap_or_else(|| resource.order.is_some())
 }
 
 /// HomePort-view config for a resource, used by `get --web`. `path` is a
@@ -209,5 +232,60 @@ exclude = ["create"]
         )
         .unwrap_err();
         assert!(err.to_string().contains("operation_prefix"));
+    }
+
+    // -- wants_wait -----------------------------------------------------
+
+    #[test]
+    fn wants_wait_defaults_to_false_for_a_plain_crud_resource() {
+        let resource = parse_resource(
+            r#"
+[commands]
+operation_prefix = "things"
+"#,
+        );
+        assert!(!wants_wait(&resource));
+    }
+
+    #[test]
+    fn wants_wait_defaults_to_true_when_the_resource_has_an_order_block() {
+        let resource = parse_resource(
+            r#"
+[commands]
+operation_prefix = "things"
+[order]
+offering_type = "OpenStack.Thing"
+"#,
+        );
+        assert!(wants_wait(&resource));
+    }
+
+    #[test]
+    fn wants_wait_respects_an_explicit_true_override_without_an_order_block() {
+        // Mirrors marketplace/order: no [order] block of its own (it *is*
+        // the order), but still needs `wait`.
+        let resource = parse_resource(
+            r#"
+wait = true
+[commands]
+operation_prefix = "marketplace_orders"
+"#,
+        );
+        assert!(resource.order.is_none());
+        assert!(wants_wait(&resource));
+    }
+
+    #[test]
+    fn wants_wait_respects_an_explicit_false_override_even_with_an_order_block() {
+        let resource = parse_resource(
+            r#"
+wait = false
+[commands]
+operation_prefix = "things"
+[order]
+offering_type = "OpenStack.Thing"
+"#,
+        );
+        assert!(!wants_wait(&resource));
     }
 }

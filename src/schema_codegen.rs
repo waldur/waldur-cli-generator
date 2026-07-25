@@ -506,6 +506,7 @@ mod tests {
             order,
             actions: None,
             web: None,
+            wait: None,
         }
     }
 

@@ -1091,8 +1091,10 @@ fn generate_resource_module(
         emitted.push(emit_order_verbs(resource, &resource_pascal, &resource_enum_ident, order_skeletons)?);
     }
 
-    if let Some(get_method_name) = resource.commands.get("get") {
-        emitted.push(emit_wait_verb(resource, &resource_pascal, &resource_enum_ident, operations, get_method_name)?);
+    if crate::manifest::wants_wait(resource) {
+        if let Some(get_method_name) = resource.commands.get("get") {
+            emitted.push(emit_wait_verb(resource, &resource_pascal, &resource_enum_ident, operations, get_method_name)?);
+        }
     }
 
     // Auto-discovered custom actions (start/stop/restart, attach/detach,
@@ -1108,7 +1110,7 @@ fn generate_resource_module(
             used_names.insert("provision");
             used_names.insert("terminate");
         }
-        if resource.commands.contains_key("get") {
+        if crate::manifest::wants_wait(resource) && resource.commands.contains_key("get") {
             used_names.insert("wait");
         }
         for action in actions {
@@ -1374,6 +1376,7 @@ mod tests {
             order,
             actions: None,
             web: None,
+            wait: None,
         }
     }
 
@@ -1694,7 +1697,10 @@ mod tests {
 
     #[test]
     fn generate_resource_module_bails_when_an_action_collides_with_an_existing_verb() {
-        let resource = resource("thing", &[("get", "things_get")], None);
+        // Needs `wait = true` so `wants_wait` actually emits the `wait` verb
+        // this test means to collide with -- see `manifest::wants_wait`.
+        let mut resource = resource("thing", &[("get", "things_get")], None);
+        resource.wait = Some(true);
         let mut operations = HashMap::new();
         operations.insert("things_get".to_string(), op("/api/things/{uuid}/", "get", Some("uuid")));
         let empty_map: HashMap<String, Vec<String>> = HashMap::new();

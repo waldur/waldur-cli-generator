@@ -585,7 +585,7 @@ pub fn generate(
                 pages.push(terminate_page(&group.name, resource));
             }
 
-            if resource.commands.contains_key("get") {
+            if crate::manifest::wants_wait(resource) && resource.commands.contains_key("get") {
                 verbs_for_index.push("wait".to_string());
                 pages.push(wait_page(&group.name, resource));
             }
@@ -622,6 +622,7 @@ mod tests {
             order: None,
             actions: None,
             web: None,
+            wait: None,
         }
     }
 
