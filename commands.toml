@@ -143,6 +143,27 @@ about = "Manage OpenStack resources"
     # (attach_to_port/set_erred/update_description) are excluded for now.
     exclude = ["pull", "attach_to_port", "set_erred", "update_description"]
 
+  # Read-only catalog data, not managed resources: you list these to pick the
+  # `flavor`/`image` URLs an instance `provision` order needs. Without them
+  # the CLI can order an instance but can't tell you what to order it with,
+  # so the flow had to leave the terminal. Both are list/get-only server-side
+  # (no create/update/delete operationIds exist to derive).
+  [[group.resource]]
+  name = "flavor"
+  about = "OpenStack flavors (VM sizes)"
+  columns = ["uuid", "name", "cores", "ram", "disk"]
+    [group.resource.commands]
+    operation_prefix = "openstack_flavors"
+    exclude = ["create", "update", "delete"]
+
+  [[group.resource]]
+  name = "image"
+  about = "OpenStack images"
+  columns = ["uuid", "name", "min_disk", "min_ram"]
+    [group.resource.commands]
+    operation_prefix = "openstack_images"
+    exclude = ["create", "update", "delete"]
+
 [[group]]
 name = "team"
 about = "Manage team membership and organization access"
