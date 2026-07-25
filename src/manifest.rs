@@ -33,6 +33,29 @@ pub struct Resource {
     /// resource at once). See `ActionsConfig`.
     #[serde(default)]
     pub actions: Option<ActionsConfig>,
+    /// Set to give `get` a `--web` flag that opens this resource in Waldur's
+    /// web UI (HomePort) instead of printing it. HomePort's routing isn't
+    /// part of the OpenAPI schema -- both `path` and `uuid_field` are read
+    /// from HomePort's own source (`src/*/routes.ts`), so this is opt-in per
+    /// resource and needs re-checking there if HomePort's routes change.
+    /// See `WebConfig`.
+    #[serde(default)]
+    pub web: Option<WebConfig>,
+}
+
+/// HomePort-view config for a resource, used by `get --web`. `path` is a
+/// HomePort route template containing a literal `{uuid}` placeholder (e.g.
+/// `/projects/{uuid}/`). `uuid_field` overrides what gets substituted into
+/// it: by default the CLI's own `--uuid` argument, but some resources
+/// (OpenStack instance/volume/tenant) are shown in HomePort keyed by their
+/// *marketplace* resource uuid rather than their own -- for those, set
+/// `uuid_field` to the response field to read it from instead (e.g.
+/// `"marketplace_resource_uuid"`).
+#[derive(Debug, Deserialize)]
+pub struct WebConfig {
+    pub path: String,
+    #[serde(default)]
+    pub uuid_field: Option<String>,
 }
 
 /// Custom-action discovery config for a resource. Discovery itself is

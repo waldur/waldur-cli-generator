@@ -398,10 +398,48 @@ fn emit_get_verb(
 
     let path_expr = build_path_expr(op)?;
     let method_expr = http_method_expr(op)?;
+
+    let (web_stmt, consts, needs_context) = match &resource.web {
+        Some(web) => {
+            field_defs.push(quote! {
+                /// Open this resource's page in Waldur's web UI (HomePort)
+                /// instead of printing it.
+                #[arg(long)]
+                pub web: bool,
+            });
+            let id_expr = match &web.uuid_field {
+                None => quote! { args.uuid.as_str() },
+                Some(field) => quote! {
+                    result
+                        .get(#field)
+                        .and_then(|v| v.as_str())
+                        .with_context(|| format!("response has no `{}` field needed to build the HomePort URL", #field))?
+                },
+            };
+            let web_path_const = format_ident!("{}_WEB_PATH", resource.name.to_uppercase().replace('-', "_"));
+            let path_template = &web.path;
+            let stmt = quote! {
+                if args.web {
+                    let id = #id_expr;
+                    let homeport = crate::web::resolve_homeport_url(base_url, token).await?;
+                    let url = format!("{homeport}{}", #web_path_const.replace("{uuid}", id));
+                    crate::web::open_in_browser(&url);
+                    return Ok(());
+                }
+            };
+            let consts = quote! {
+                const #web_path_const: &str = #path_template;
+            };
+            (stmt, consts, web.uuid_field.is_some())
+        }
+        None => (quote! {}, quote! {}, false),
+    };
+
     let arm = quote! {
         #resource_enum_ident::Get(args) => {
             let path = #path_expr;
             let result = crate::http::call_one(base_url, token, #method_expr, &path, None).await?;
+            #web_stmt
             crate::output::print_result(&result, COLUMNS, format)?;
         }
     };
@@ -412,7 +450,7 @@ fn emit_get_verb(
         }
     };
 
-    Ok(EmittedVerb { variant, arm, args_struct, ..Default::default() })
+    Ok(EmittedVerb { variant, arm, args_struct, consts, needs_context })
 }
 
 /// Shared by `create` and `update` -- their Args structs, skeleton/schema
@@ -1274,7 +1312,7 @@ fn generate_cli_file(manifest: &Manifest) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::manifest::OrderConfig;
+    use crate::manifest::{OrderConfig, WebConfig};
     use crate::schema::ExtractedParam;
     use std::collections::BTreeMap;
 
@@ -1286,6 +1324,7 @@ mod tests {
             commands: commands.iter().map(|(v, m)| (v.to_string(), m.to_string())).collect::<BTreeMap<_, _>>(),
             order,
             actions: None,
+            web: None,
         }
     }
 
@@ -1353,6 +1392,51 @@ mod tests {
         assert!(rendered(&emitted.args_struct).contains("pub uuid : String"));
         assert!(rendered(&emitted.arm).contains("print_result"));
         assert!(!emitted.needs_context);
+    }
+
+    #[test]
+    fn emit_get_verb_without_web_config_has_no_web_flag() {
+        let resource = resource("thing", &[("get", "things_get")], None);
+        let op = op("/api/things/{uuid}/", "get", Some("uuid"));
+        let ident = format_ident!("ThingCommand");
+        let emitted = emit_get_verb(&resource, "Thing", &ident, &op, "things_get").unwrap();
+
+        assert!(!rendered(&emitted.args_struct).contains("web"));
+        assert!(rendered(&emitted.consts).is_empty());
+    }
+
+    #[test]
+    fn emit_get_verb_web_direct_uuid_uses_the_cli_arg() {
+        let mut resource = resource("thing", &[("get", "things_get")], None);
+        resource.web = Some(WebConfig { path: "/things/{uuid}/".to_string(), uuid_field: None });
+        let op = op("/api/things/{uuid}/", "get", Some("uuid"));
+        let ident = format_ident!("ThingCommand");
+        let emitted = emit_get_verb(&resource, "Thing", &ident, &op, "things_get").unwrap();
+
+        assert!(rendered(&emitted.args_struct).contains("pub web : bool"));
+        assert!(rendered(&emitted.consts).contains("THING_WEB_PATH"));
+        assert!(rendered(&emitted.consts).contains("/things/{uuid}/"));
+        assert!(rendered(&emitted.arm).contains("args . uuid . as_str ()"));
+        assert!(rendered(&emitted.arm).contains("resolve_homeport_url"));
+        assert!(rendered(&emitted.arm).contains("open_in_browser"));
+        assert!(!emitted.needs_context, "direct uuid case doesn't need to unwrap a response field");
+    }
+
+    #[test]
+    fn emit_get_verb_web_indirect_uuid_reads_the_response_field() {
+        let mut resource = resource("thing", &[("get", "things_get")], None);
+        resource.web = Some(WebConfig {
+            path: "/resource-details/{uuid}".to_string(),
+            uuid_field: Some("marketplace_resource_uuid".to_string()),
+        });
+        let op = op("/api/things/{uuid}/", "get", Some("uuid"));
+        let ident = format_ident!("ThingCommand");
+        let emitted = emit_get_verb(&resource, "Thing", &ident, &op, "things_get").unwrap();
+
+        let arm = rendered(&emitted.arm);
+        assert!(arm.contains("result . get (\"marketplace_resource_uuid\")"));
+        assert!(arm.contains("response has no"));
+        assert!(emitted.needs_context, "unwrapping the response field needs Context in scope");
     }
 
     #[test]

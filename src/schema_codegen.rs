@@ -503,6 +503,7 @@ mod tests {
             commands: commands.iter().map(|(v, m)| (v.to_string(), m.to_string())).collect(),
             order,
             actions: None,
+            web: None,
         }
     }
 

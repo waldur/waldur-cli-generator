@@ -29,6 +29,13 @@ about = "Manage OpenStack resources"
     update = "openstack_tenants_update"
     [group.resource.order]
     offering_type = "OpenStack.Tenant"
+    [group.resource.web]
+    # HomePort has no dedicated OpenStack-resource route -- it shows these
+    # through the generic marketplace resource-details page, keyed by the
+    # *marketplace* resource uuid (see waldur-homeport's
+    # src/marketplace/routes.ts), not the tenant/instance/volume's own.
+    path = "/resource-details/{uuid}"
+    uuid_field = "marketplace_resource_uuid"
 
   [[group.resource]]
   name = "instance"
@@ -68,6 +75,10 @@ about = "Manage OpenStack resources"
       "update_ports",
       "update_security_groups",
     ]
+    [group.resource.web]
+    # See the tenant resource's web comment above.
+    path = "/resource-details/{uuid}"
+    uuid_field = "marketplace_resource_uuid"
 
   [[group.resource]]
   name = "volume"
@@ -84,6 +95,10 @@ about = "Manage OpenStack resources"
     # actions comment above for the rationale); body-having actions (attach/
     # extend/retype/set_erred/snapshot) are excluded for now.
     exclude = ["pull", "attach", "extend", "retype", "set_erred", "snapshot"]
+    [group.resource.web]
+    # See the tenant resource's web comment above.
+    path = "/resource-details/{uuid}"
+    uuid_field = "marketplace_resource_uuid"
 
   [[group.resource]]
   name = "network"
@@ -143,6 +158,9 @@ about = "Manage team membership and organization access"
     create = "customers_create"
     update = "customers_update"
     delete = "customers_destroy"
+    [group.resource.web]
+    # From waldur-homeport's src/customer/routes.ts.
+    path = "/organizations/{uuid}/"
 
   [[group.resource]]
   name = "project"
@@ -154,6 +172,9 @@ about = "Manage team membership and organization access"
     create = "projects_create"
     update = "projects_update"
     delete = "projects_destroy"
+    [group.resource.web]
+    # From waldur-homeport's src/project/routes.ts.
+    path = "/projects/{uuid}/"
 
   [[group.resource]]
   name = "user"
@@ -288,6 +309,11 @@ about = "Browse offerings and provision resources of any offering type"
       "team",
       "team_members",
     ]
+    [group.resource.web]
+    # From waldur-homeport's src/marketplace/routes.ts -- the generic
+    # resource-details page every offering type (OpenStack included) shows
+    # through, keyed by this resource's own uuid.
+    path = "/resource-details/{uuid}"
 
   # get-only: an order's uuid is what `provision --no-wait` prints, and this
   # is the direct way to check on (or `wait` for) it afterwards, rather than
@@ -317,3 +343,6 @@ about = "Browse offerings and provision resources of any offering type"
       "offering",
       "resource",
     ]
+    [group.resource.web]
+    # From waldur-homeport's src/marketplace/routes.ts.
+    path = "/marketplace-order-details/{uuid}/"
