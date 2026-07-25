@@ -138,11 +138,25 @@ pub struct ExtractedOperation {
     /// per operation -- asserted at extraction time.
     pub path_param: Option<String>,
     /// Query parameters, in schema order, excluding `page`/`page_size` and
-    /// the `field` filter (handled separately via `field_enum_name`).
+    /// the `field`/`o` filters (handled separately via `field_enum_name`/
+    /// `order_enum_name`).
     pub query_params: Vec<ExtractedParam>,
     /// Name of the schema this operation's `field` query param's items
     /// resolve to (e.g. `"CustomerFieldEnum"`), if it has one.
     pub field_enum_name: Option<String>,
+    /// Whether this operation has an `o` (ordering) query param at all --
+    /// not every list endpoint does (confirmed against the live schema:
+    /// most OpenStack resources' lists lack one entirely). Drives whether
+    /// `--order` is emitted; `order_enum_name` separately drives whether
+    /// its values are validated client-side, since some resources declare
+    /// `o` as a bare `string` with no enum (e.g. customers) rather than the
+    /// more common `array` of an `{Resource}OEnum`.
+    pub has_order: bool,
+    /// Name of the schema this operation's `o` query param's items resolve
+    /// to (e.g. `"OpenStackFlavorOEnum"` -- each orderable field appears
+    /// twice, once bare for ascending and once `-`-prefixed for
+    /// descending), if it has one.
+    pub order_enum_name: Option<String>,
     /// Name of the request body schema (e.g. `"CustomerRequest"`), resolved
     /// per-operation -- never guessed from the resource name, since it
     /// genuinely diverges (see e.g. `role.rs`'s `RoleModifyRequest`).
@@ -248,6 +262,8 @@ fn extract_from_found(
     let mut path_param: Option<String> = None;
     let mut query_params = Vec::new();
     let mut field_enum_name: Option<String> = None;
+    let mut has_order = false;
+    let mut order_enum_name: Option<String> = None;
 
     for entry in &op.parameters {
         let param: std::borrow::Cow<RawParameter> = match entry {
@@ -281,6 +297,17 @@ fn extract_from_found(
                         .map(|s| s.to_string());
                     continue;
                 }
+                if param.name == "o" {
+                    has_order = true;
+                    order_enum_name = param
+                        .schema
+                        .items
+                        .as_ref()
+                        .and_then(|items| items.reference.as_deref())
+                        .and_then(schema_ref_name)
+                        .map(|s| s.to_string());
+                    continue;
+                }
                 query_params.push(ExtractedParam {
                     name: param.name.clone(),
                     kind: classify_param(&param),
@@ -305,6 +332,8 @@ fn extract_from_found(
         path_param,
         query_params,
         field_enum_name,
+        has_order,
+        order_enum_name,
         request_body_type,
     })
 }

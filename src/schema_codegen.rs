@@ -491,6 +491,8 @@ mod tests {
             path_param: path_param.map(str::to_string),
             query_params: vec![ExtractedParam { name: "name".to_string(), kind: ParamKind::OptionalStr }],
             field_enum_name: None,
+            has_order: false,
+            order_enum_name: None,
             request_body_type: request_body_type.map(str::to_string),
         }
     }

@@ -177,6 +177,7 @@ fn assert_no_query_params(resource: &Resource, verb: &str, method_name: &str, op
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn emit_list_verb(
     resource: &Resource,
     resource_pascal: &str,
@@ -185,6 +186,7 @@ fn emit_list_verb(
     method_name: &str,
     list_has_project: bool,
     field_enum_values: &HashMap<String, Vec<String>>,
+    order_enum_values: &HashMap<String, Vec<String>>,
 ) -> Result<EmittedVerb> {
     let mut field_defs = Vec::new();
     if let Some(field) = path_param_field(op, false) {
@@ -276,6 +278,35 @@ fn emit_list_verb(
         },
     });
 
+    // Not every list has an `o` (ordering) param at all -- most OpenStack
+    // resources' lists lack one entirely -- so unlike --fields (which every
+    // list gets), --order is only emitted when the schema actually has one.
+    if op.has_order {
+        let order_doc = "Sort results server-side by these fields (comma-separated); \
+                          prefix a field with - for descending, e.g. -created.";
+        let valid_order_values = op.order_enum_name.as_ref().and_then(|name| order_enum_values.get(name));
+        field_defs.push(match valid_order_values {
+            // allow_hyphen_values: without it, clap treats "-cores" (a
+            // descending field, per DRF's own `-`-prefix convention) as an
+            // unrecognized short flag rather than this arg's value.
+            Some(values) => quote! {
+                #[doc = #order_doc]
+                #[arg(
+                    long = "order",
+                    value_delimiter = ',',
+                    allow_hyphen_values = true,
+                    value_parser = clap::builder::PossibleValuesParser::new([#(#values),*]),
+                )]
+                pub order: Option<Vec<String>>,
+            },
+            None => quote! {
+                #[doc = #order_doc]
+                #[arg(long = "order", value_delimiter = ',', allow_hyphen_values = true)]
+                pub order: Option<Vec<String>>,
+            },
+        });
+    }
+
     let args_ident = format_ident!("{}ListArgs", resource_pascal);
     let about = format!("List {}", resource.about.to_lowercase());
     let variant = quote! {
@@ -298,9 +329,23 @@ fn emit_list_verb(
     } else {
         quote! {}
     };
+    // DRF's OrderingFilter reads its `o` param as a single comma-joined
+    // string (`ordering.split(',')` server-side) regardless of how the
+    // schema documents its type -- so multiple --order values are joined
+    // into one query param, never repeated as separate `o=`/`o=` pairs.
+    let order_inject = if op.has_order {
+        quote! {
+            if let Some(order) = &args.order {
+                query_params.push(("o".to_string(), order.join(",")));
+            }
+        }
+    } else {
+        quote! {}
+    };
     let output_stmt = quote! {
         let mut query_params: Vec<(String, String)> = crate::filter::parse_filters(&args.filter, FILTER_SPEC)?;
         #project_inject
+        #order_inject
         // Table always narrows the server fetch to its own display columns
         // (there's never a reason to fetch more than what it shows);
         // json/toon/tsv fetch the complete object by default, but --fields
@@ -960,6 +1005,7 @@ fn generate_resource_module(
     resource: &Resource,
     operations: &HashMap<String, ExtractedOperation>,
     field_enum_values: &HashMap<String, Vec<String>>,
+    order_enum_values: &HashMap<String, Vec<String>>,
     request_skeletons: &HashMap<String, String>,
     request_json_schemas: &HashMap<String, String>,
     order_skeletons: &HashMap<String, String>,
@@ -1023,6 +1069,7 @@ fn generate_resource_module(
                 method_name,
                 list_has_project,
                 field_enum_values,
+                order_enum_values,
             )?,
             "get" => emit_get_verb(resource, &resource_pascal, &resource_enum_ident, op, method_name)?,
             "create" | "update" => emit_body_verb(
@@ -1160,6 +1207,7 @@ pub fn generate_all(
     manifest: &Manifest,
     operations: &HashMap<String, ExtractedOperation>,
     field_enum_values: &HashMap<String, Vec<String>>,
+    order_enum_values: &HashMap<String, Vec<String>>,
     request_skeletons: &HashMap<String, String>,
     request_json_schemas: &HashMap<String, String>,
     order_skeletons: &HashMap<String, String>,
@@ -1175,6 +1223,7 @@ pub fn generate_all(
                 resource,
                 operations,
                 field_enum_values,
+                order_enum_values,
                 request_skeletons,
                 request_json_schemas,
                 order_skeletons,
@@ -1336,6 +1385,8 @@ mod tests {
             path_param: path_param.map(str::to_string),
             query_params: Vec::new(),
             field_enum_name: None,
+            has_order: false,
+            order_enum_name: None,
             request_body_type: Some("SomeRequest".to_string()),
         }
     }
@@ -1447,6 +1498,71 @@ mod tests {
         let ident = format_ident!("ThingCommand");
         let err = emit_get_verb(&resource, "Thing", &ident, &op, "things_get").unwrap_err();
         assert!(err.to_string().contains("query parameter"));
+    }
+
+    // -- emit_list_verb's --order flag ------------------------------------
+
+    #[test]
+    fn emit_list_verb_without_an_o_param_omits_order_entirely() {
+        let resource = resource("thing", &[("list", "things_list")], None);
+        let op = op("/api/things/", "list", None);
+        let ident = format_ident!("ThingCommand");
+        let empty: HashMap<String, Vec<String>> = HashMap::new();
+
+        let emitted =
+            emit_list_verb(&resource, "Thing", &ident, &op, "things_list", false, &empty, &empty).unwrap();
+
+        assert!(!rendered(&emitted.args_struct).contains("pub order"));
+        assert!(!rendered(&emitted.arm).contains("\"o\""));
+    }
+
+    #[test]
+    fn emit_list_verb_with_o_param_but_no_enum_is_unclamped() {
+        let resource = resource("thing", &[("list", "things_list")], None);
+        let mut op = op("/api/things/", "list", None);
+        op.has_order = true;
+        op.order_enum_name = None; // e.g. customers' bare `string` "o" param
+        let ident = format_ident!("ThingCommand");
+        let empty: HashMap<String, Vec<String>> = HashMap::new();
+
+        let emitted =
+            emit_list_verb(&resource, "Thing", &ident, &op, "things_list", false, &empty, &empty).unwrap();
+
+        assert!(rendered(&emitted.args_struct).contains("pub order : Option < Vec < String >>"));
+        assert!(!rendered(&emitted.args_struct).contains("PossibleValuesParser"));
+        assert!(rendered(&emitted.args_struct).contains("allow_hyphen_values"));
+        assert!(rendered(&emitted.arm).contains("\"o\" . to_string ()"));
+        assert!(rendered(&emitted.arm).contains("order . join (\",\")"));
+    }
+
+    #[test]
+    fn emit_list_verb_with_order_enum_validates_values() {
+        let resource = resource("thing", &[("list", "things_list")], None);
+        let mut op = op("/api/things/", "list", None);
+        op.has_order = true;
+        op.order_enum_name = Some("ThingOEnum".to_string());
+        let ident = format_ident!("ThingCommand");
+        let order_enum_values: HashMap<String, Vec<String>> =
+            [("ThingOEnum".to_string(), vec!["name".to_string(), "-name".to_string()])].into();
+        let empty: HashMap<String, Vec<String>> = HashMap::new();
+
+        let emitted = emit_list_verb(
+            &resource,
+            "Thing",
+            &ident,
+            &op,
+            "things_list",
+            false,
+            &empty,
+            &order_enum_values,
+        )
+        .unwrap();
+
+        assert!(rendered(&emitted.args_struct).contains("PossibleValuesParser"));
+        assert!(rendered(&emitted.args_struct).contains("\"name\""));
+        assert!(rendered(&emitted.args_struct).contains("\"-name\""));
+        // -name (descending) must not be misparsed by clap as a short flag.
+        assert!(rendered(&emitted.args_struct).contains("allow_hyphen_values"));
     }
 
     #[test]
@@ -1593,6 +1709,7 @@ mod tests {
         let err = generate_resource_module(
             &resource,
             &operations,
+            &empty_map,
             &empty_map,
             &empty_skeletons,
             &empty_skeletons,

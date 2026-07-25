@@ -96,6 +96,23 @@ fn main() -> Result<()> {
         field_enum_values.insert(enum_name.clone(), values);
     }
 
+    // Same, for --order: resolves each orderable field's enum, which lists
+    // every field twice (bare for ascending, `-`-prefixed for descending).
+    // Not every list operation has an `o` param at all (many OpenStack
+    // resources' lists lack one), and among those that do, not all declare
+    // it as an enum (e.g. customers' is a bare `string`) -- both are fine,
+    // `order_enum_name` is simply `None` and codegen skips validation.
+    let mut order_enum_values: HashMap<String, Vec<String>> = HashMap::new();
+    for op in operations.values().chain(action_operations.iter().copied()) {
+        let Some(enum_name) = &op.order_enum_name else { continue };
+        if order_enum_values.contains_key(enum_name) {
+            continue;
+        }
+        let values = schema::extract_enum_values(&doc, enum_name)
+            .with_context(|| format!("resolving --order values for operation `{}`", op.operation_id))?;
+        order_enum_values.insert(enum_name.clone(), values);
+    }
+
     // Build a fillable request-body template for every operation that has a
     // request body, so codegen can embed it for `--generate-skeleton`. Keyed
     // by the request type name, since the same type is reused across
@@ -143,6 +160,7 @@ fn main() -> Result<()> {
         &manifest,
         &operations,
         &field_enum_values,
+        &order_enum_values,
         &request_skeletons,
         &request_json_schemas,
         &order_skeletons,
