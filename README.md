@@ -18,9 +18,9 @@ separate target repo.
 ## What's covered
 
 [`commands.toml`](commands.toml) is the single source of truth for what's in scope --
-deliberately a curated subset (~60 commands: `list`/`get`/`create`/`update`/`delete` across
-16 OpenStack + team-management resources), not a mechanical 1:1 wrap of Waldur's ~451
-operations. See the comment at the top of that file for what's excluded and why (mainly:
+deliberately a curated subset (`list`/`get`/`create`/`update`/`delete` across a handful of
+OpenStack, team-management, and marketplace resources), not a mechanical 1:1 wrap of Waldur's
+~451 operations. See the comment at the top of that file for what's excluded and why (mainly:
 OpenStack tenant/instance/volume creation goes through Waldur's marketplace ordering flow).
 
 To add a resource or verb: add a `commands.*` entry to `commands.toml` referencing the exact

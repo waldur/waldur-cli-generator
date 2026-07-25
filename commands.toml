@@ -181,44 +181,6 @@ about = "Manage team membership and organization access"
     [group.resource.commands]
     operation_prefix = "roles"
 
-  [[group.resource]]
-  name = "user-invitation"
-  about = "User invitations"
-  columns = ["uuid", "email", "role_name", "state"]
-    [group.resource.commands]
-    operation_prefix = "user_invitations"
-
-  [[group.resource]]
-  name = "organization-group"
-  about = "Organization groups"
-  columns = ["uuid", "name", "parent_uuid"]
-    [group.resource.commands]
-    operation_prefix = "organization_groups"
-
-  [[group.resource]]
-  name = "customer-permissions-review"
-  about = "Customer permission reviews (read-only)"
-  columns = ["uuid", "customer_name", "is_pending"]
-    [group.resource.commands]
-    operation_prefix = "customer_permissions_reviews"
-    exclude = ["create", "update", "delete"]
-
-  [[group.resource]]
-  name = "project-permissions-review"
-  about = "Project permission reviews (read-only)"
-  columns = ["uuid", "project_name", "is_pending"]
-    [group.resource.commands]
-    operation_prefix = "project_permissions_reviews"
-    exclude = ["create", "update", "delete"]
-
-  [[group.resource]]
-  name = "user-permission-request"
-  about = "User permission requests (read-only)"
-  columns = ["uuid", "project_name", "role_name", "state"]
-    [group.resource.commands]
-    operation_prefix = "user_permission_requests"
-    exclude = ["create", "update", "delete"]
-
 [[group]]
 name = "marketplace"
 about = "Browse offerings and provision resources of any offering type"
