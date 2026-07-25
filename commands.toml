@@ -202,22 +202,6 @@ about = "Manage team membership and organization access"
     [group.resource.commands]
     operation_prefix = "roles"
 
-  # PUT/PATCH don't exist -- tokens are immutable after creation, so there's
-  # no `update` operationId to derive.
-  [[group.resource]]
-  name = "personal-access-token"
-  about = "Personal access tokens (named, scoped, time-limited API credentials)"
-  columns = ["uuid", "name", "token_prefix", "expires_at", "is_active"]
-    [group.resource.commands]
-    operation_prefix = "personal_access_tokens"
-    exclude = ["update"]
-    [group.resource.actions]
-    # `rotate` (POST, bodyless: revokes the old token and creates a new one
-    # with the same name/scopes/expiration) is the only action nested under
-    # this resource's own {uuid}/ path -- available_scopes/
-    # available_binding_targets/count live at the collection level instead,
-    # so discovery never reaches them; no exclude list needed.
-
 [[group]]
 name = "marketplace"
 about = "Browse offerings and provision resources of any offering type"
@@ -321,3 +305,37 @@ about = "Browse offerings and provision resources of any offering type"
     [group.resource.web]
     # From waldur-homeport's src/marketplace/routes.ts.
     path = "/marketplace-order-details/{uuid}/"
+
+[[group]]
+name = "auth"
+about = "Manage your own authentication credentials (personal access tokens, SSH keys)"
+
+  # PUT/PATCH don't exist -- tokens are immutable after creation, so there's
+  # no `update` operationId to derive.
+  [[group.resource]]
+  name = "personal-access-token"
+  about = "Personal access tokens (named, scoped, time-limited API credentials)"
+  columns = ["uuid", "name", "token_prefix", "expires_at", "is_active"]
+    [group.resource.commands]
+    operation_prefix = "personal_access_tokens"
+    exclude = ["update"]
+    [group.resource.actions]
+    # `rotate` (POST, bodyless: revokes the old token and creates a new one
+    # with the same name/scopes/expiration) is the only action nested under
+    # this resource's own {uuid}/ path -- available_scopes/
+    # available_binding_targets/count live at the collection level instead,
+    # so discovery never reaches them; no exclude list needed.
+
+  # No update operationId either -- an SSH key is identified by its public
+  # key material, so there's nothing sensible to PATCH; delete and re-add
+  # instead. `history`/`history/at` are nested under {uuid}/ (so discovery
+  # would reach them) but excluded -- they're audit trail, not actions.
+  [[group.resource]]
+  name = "ssh-key"
+  about = "SSH public keys"
+  columns = ["uuid", "name", "fingerprint_md5", "is_shared"]
+    [group.resource.commands]
+    operation_prefix = "keys"
+    exclude = ["update"]
+    [group.resource.actions]
+    exclude = ["history"]
