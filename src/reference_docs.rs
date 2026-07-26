@@ -312,18 +312,36 @@ fn update_page(
     page(group, &resource.name, "update", md)
 }
 
-fn delete_page(group: &str, resource: &Resource, op: &ExtractedOperation) -> ReferencePage {
+fn delete_page(
+    group: &str,
+    resource: &Resource,
+    op: &ExtractedOperation,
+    list_op: Option<&ExtractedOperation>,
+) -> ReferencePage {
     let cmd = format!("waldur-cli {group} {} delete", resource.name);
     let mut md = format!(
-        "# `{cmd}`\n\nDelete {}.\n\n## Usage\n\n```bash\n{cmd} <UUID>\n```\n",
+        "# `{cmd}`\n\nDelete {}. Batch-capable: pass several UUIDs, or omit them and pipe UUIDs \
+         in on stdin (one per line -- a bare UUID or a JSON object with a `uuid` field, so \
+         `list --format ndjson` composes directly). One failure doesn't stop the rest; the \
+         command exits non-zero afterward if any item failed.\n\n\
+         ## Usage\n\n```bash\n{cmd} [UUID]...\n```\n",
         resource.about.to_lowercase()
     );
     md += &options_table(&[(
-        "<UUID>".to_string(),
-        "positional, required".to_string(),
-        format!("{} of the resource.", op.path_param.as_deref().unwrap_or("uuid")),
+        "[UUID]...".to_string(),
+        "positional, 0 or more".to_string(),
+        format!("{}(s) of the resource. Reads from stdin if omitted.", op.path_param.as_deref().unwrap_or("uuid")),
     )]);
-    md += &format!("\n## Examples\n\n```bash\n{cmd} <uuid>\n```\n\nPreview without deleting:\n\n```bash\n{cmd} <uuid> --dry-run\n```\n");
+    let list_cmd = format!("waldur-cli {group} {} list --format ndjson", resource.name);
+    let list_example = match list_op.and_then(pick_example_filter) {
+        Some((key, value)) => format!("{list_cmd} --filter {key}={value}"),
+        None => list_cmd,
+    };
+    md += &format!(
+        "\n## Examples\n\n```bash\n{cmd} <uuid>\n```\n\nSeveral at once:\n\n```bash\n{cmd} <uuid-1> <uuid-2>\n```\n\n\
+         From a filtered list, without an intermediate `jq`:\n\n```bash\n{list_example} | {cmd}\n```\n\n\
+         Preview without deleting:\n\n```bash\n{cmd} <uuid> --dry-run\n```\n"
+    );
     md += GLOBAL_OPTIONS;
     page(group, &resource.name, "delete", md)
 }
@@ -485,14 +503,20 @@ fn action_page(
         }
         None => {
             let method = op.http_verb.to_uppercase();
-            let mut md = format!("# `{cmd}`\n\n{about}.\n\n## Usage\n\n```bash\n{cmd} <UUID>\n```\n");
+            let mut md = format!(
+                "# `{cmd}`\n\n{about}. Batch-capable: pass several UUIDs, or omit them and pipe \
+                 UUIDs in on stdin (one per line -- a bare UUID or a JSON object with a `uuid` \
+                 field, so `list --format ndjson` composes directly). One failure doesn't stop \
+                 the rest; the command exits non-zero afterward if any item failed.\n\n\
+                 ## Usage\n\n```bash\n{cmd} [UUID]...\n```\n"
+            );
             md += &options_table(&[(
-                "<UUID>".into(),
-                "positional, required".into(),
-                "uuid of the resource.".into(),
+                "[UUID]...".into(),
+                "positional, 0 or more".into(),
+                "uuid(s) of the resource. Reads from stdin if omitted.".into(),
             )]);
             md += &format!(
-                "\n## Examples\n\n```bash\n{cmd} <uuid>\n```\n\n(sends a bodyless {method} to `{}`)\n",
+                "\n## Examples\n\n```bash\n{cmd} <uuid>\n```\n\nSeveral at once:\n\n```bash\n{cmd} <uuid-1> <uuid-2>\n```\n\n(sends a bodyless {method} to `{}` for each)\n",
                 op.path
             );
             md += GLOBAL_OPTIONS;
@@ -573,7 +597,12 @@ pub fn generate(
                     "get" => get_page(&group.name, resource, op),
                     "create" => create_page(&group.name, resource, op, request_skeletons),
                     "update" => update_page(&group.name, resource, op, request_skeletons),
-                    "delete" => delete_page(&group.name, resource, op),
+                    "delete" => delete_page(
+                        &group.name,
+                        resource,
+                        op,
+                        resource.commands.get("list").and_then(|m| operations.get(m)),
+                    ),
                     _ => continue,
                 });
             }
@@ -730,6 +759,67 @@ mod tests {
         let rendered = list_page("team", &resource, &op, &empty, &empty).content;
 
         assert!(rendered.contains("--order uuid --limit 1"));
+    }
+
+    // -- delete_page: batch/stdin behavior + a real filter key in the
+    // composability example, not an arbitrary/invalid one -------------------
+
+    #[test]
+    fn delete_page_documents_batching_and_shows_a_vec_positional() {
+        let resource = resource("thing", &["uuid", "name"]);
+        let op = ExtractedOperation {
+            operation_id: "things_destroy".to_string(),
+            path: "/api/things/{uuid}/".to_string(),
+            http_verb: "delete".to_string(),
+            path_param: Some("uuid".to_string()),
+            query_params: Vec::new(),
+            field_enum_name: None,
+            has_order: false,
+            order_enum_name: None,
+            request_body_type: None,
+        };
+        let rendered = delete_page("team", &resource, &op, None).content;
+        assert!(rendered.contains("[UUID]..."));
+        assert!(rendered.contains("Batch-capable"));
+        assert!(rendered.contains("stdin"));
+    }
+
+    #[test]
+    fn delete_page_composability_example_uses_a_real_filter_key_when_list_has_one() {
+        let resource = resource("thing", &["uuid", "name"]);
+        let op = ExtractedOperation {
+            operation_id: "things_destroy".to_string(),
+            path: "/api/things/{uuid}/".to_string(),
+            http_verb: "delete".to_string(),
+            path_param: Some("uuid".to_string()),
+            query_params: Vec::new(),
+            field_enum_name: None,
+            has_order: false,
+            order_enum_name: None,
+            request_body_type: None,
+        };
+        let list_op = op_with_params(vec![param("state", ParamKind::OptionalStr)]);
+        let rendered = delete_page("team", &resource, &op, Some(&list_op)).content;
+        assert!(rendered.contains("--filter state=OK | waldur-cli team thing delete"));
+    }
+
+    #[test]
+    fn delete_page_composability_example_has_no_filter_when_list_has_none() {
+        let resource = resource("thing", &["uuid", "name"]);
+        let op = ExtractedOperation {
+            operation_id: "things_destroy".to_string(),
+            path: "/api/things/{uuid}/".to_string(),
+            http_verb: "delete".to_string(),
+            path_param: Some("uuid".to_string()),
+            query_params: Vec::new(),
+            field_enum_name: None,
+            has_order: false,
+            order_enum_name: None,
+            request_body_type: None,
+        };
+        let rendered = delete_page("team", &resource, &op, None).content;
+        assert!(rendered.contains("list --format ndjson | waldur-cli team thing delete"));
+        assert!(!rendered.contains("--filter"));
     }
 
     // -- compact_json --------------------------------------------------

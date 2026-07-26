@@ -98,6 +98,29 @@ fn build_path_expr(op: &ExtractedOperation) -> Result<TokenStream> {
     }
 }
 
+/// Like `build_path_expr`, but substitutes a given local variable rather
+/// than `args.<path_param>` -- used by a batch-capable verb's per-item loop,
+/// where the path param comes off the loop variable (one UUID at a time
+/// from `crate::batch::resolve_uuids`), not straight off the parsed `Args`.
+fn build_path_expr_for_ident(op: &ExtractedOperation, var: &proc_macro2::Ident) -> Result<TokenStream> {
+    match &op.path_param {
+        Some(param_name) => {
+            let placeholder = format!("{{{param_name}}}");
+            let (prefix, suffix) = op.path.split_once(&placeholder).with_context(|| {
+                format!(
+                    "operation `{}`: path `{}` doesn't contain its own path param `{{{param_name}}}`",
+                    op.operation_id, op.path
+                )
+            })?;
+            Ok(quote! { format!("{}{}{}", #prefix, #var, #suffix) })
+        }
+        None => {
+            let path = &op.path;
+            Ok(quote! { #path.to_string() })
+        }
+    }
+}
+
 /// Statements binding `let path = ...;` for a create/update operation, where
 /// the path param (if any) is an `Option` positional -- enforced present here
 /// at runtime rather than by clap, so `--generate-skeleton` stays reachable
@@ -159,6 +182,24 @@ fn path_param_field(op: &ExtractedOperation, optional: bool) -> Option<TokenStre
         quote! { pub #ident: Option<String>, }
     } else {
         quote! { pub #ident: String, }
+    })
+}
+
+/// Like `path_param_field`, but for a batch-capable verb (`delete`, or a
+/// bodyless action) -- `Vec<String>` instead of `String`, so clap accepts
+/// zero or more positional UUIDs. Zero is a legal value at the clap level;
+/// `crate::batch::resolve_uuids` is what turns that into "read them from
+/// stdin instead" at runtime, which is what lets `list --format ndjson |
+/// ... | waldur-cli ... delete` compose.
+fn batch_path_param_field(op: &ExtractedOperation) -> Option<TokenStream> {
+    let path_param = op.path_param.as_ref()?;
+    let ident = field_ident(path_param);
+    Some(quote! {
+        /// UUID(s) to operate on. Omit to read them from stdin instead,
+        /// one per line -- either a bare UUID or a JSON object with a
+        /// `uuid` field, so piping `list --format ndjson` straight in
+        /// works without an intermediate `jq -r .uuid`.
+        pub #ident: Vec<String>,
     })
 }
 
@@ -633,7 +674,7 @@ fn emit_delete_verb(
     assert_no_query_params(resource, "delete", method_name, op)?;
 
     let mut field_defs = Vec::new();
-    if let Some(field) = path_param_field(op, false) {
+    if let Some(field) = batch_path_param_field(op) {
         field_defs.push(field);
     }
 
@@ -644,39 +685,59 @@ fn emit_delete_verb(
         Delete(#args_ident),
     };
 
-    let path_expr = build_path_expr(op)?;
-    let method_expr = http_method_expr(op)?;
-    let method_str = op.http_verb.to_uppercase();
     let uuid_ident = op
         .path_param
         .as_ref()
         .map(|p| field_ident(p))
         .unwrap_or_else(|| format_ident!("uuid"));
+    let path_expr = build_path_expr_for_ident(op, &uuid_ident)?;
+    let method_expr = http_method_expr(op)?;
+    let method_str = op.http_verb.to_uppercase();
+    // Batched: `args.#uuid_ident` (`Vec<String>`, possibly empty) resolves
+    // through stdin if empty, then each UUID is deleted and reported
+    // independently -- one bad UUID in a batch shouldn't abort the rest, so
+    // failures are collected and only fail the whole command (non-zero
+    // exit) after every item has been attempted.
     let arm = quote! {
         #resource_enum_ident::Delete(args) => {
-            let path = #path_expr;
-            if dry_run {
-                return crate::output::print_dry_run(#method_str, &path, None, format);
+            let uuids = crate::batch::resolve_uuids(args.#uuid_ident)?;
+            let mut failed = Vec::new();
+            for #uuid_ident in uuids {
+                let path = #path_expr;
+                if dry_run {
+                    crate::output::print_dry_run(#method_str, &path, None, format)?;
+                    continue;
+                }
+                match crate::http::call_one(base_url, token, #method_expr, &path, None).await {
+                    Ok(_) => {
+                        match format {
+                            crate::output::OutputFormat::Json | crate::output::OutputFormat::Ndjson => {
+                                println!("{}", serde_json::json!({"deleted": true, "uuid": #uuid_ident}));
+                            }
+                            crate::output::OutputFormat::Table => {
+                                println!("Deleted {}", #uuid_ident);
+                            }
+                            crate::output::OutputFormat::Tsv => {
+                                println!("true\t{}", #uuid_ident);
+                            }
+                            crate::output::OutputFormat::Toon => {
+                                println!(
+                                    "{}",
+                                    serde_toon::to_string(
+                                        &serde_json::json!({"deleted": true, "uuid": #uuid_ident}),
+                                    )?
+                                );
+                            }
+                        }
+                    }
+                    Err(err) => {
+                        crate::batch::report_error(&#uuid_ident, &err);
+                        failed.push(#uuid_ident);
+                    }
+                }
             }
-            let _ = crate::http::call_one(base_url, token, #method_expr, &path, None).await?;
-            match format {
-                crate::output::OutputFormat::Json | crate::output::OutputFormat::Ndjson => {
-                    println!("{}", serde_json::json!({"deleted": true, "uuid": args.#uuid_ident}));
-                }
-                crate::output::OutputFormat::Table => {
-                    println!("Deleted {}", args.#uuid_ident);
-                }
-                crate::output::OutputFormat::Tsv => {
-                    println!("true\t{}", args.#uuid_ident);
-                }
-                crate::output::OutputFormat::Toon => {
-                    println!(
-                        "{}",
-                        serde_toon::to_string(
-                            &serde_json::json!({"deleted": true, "uuid": args.#uuid_ident}),
-                        )?
-                    );
-                }
+            if !failed.is_empty() {
+                anyhow::bail!("{} of the batch failed: {}", failed.len(), failed.join(", "));
             }
         }
     };
@@ -903,17 +964,28 @@ fn emit_action_verb(
         #variant_ident(#args_ident),
     };
 
+    let uuid_ident = op
+        .path_param
+        .as_ref()
+        .map(|p| field_ident(p))
+        .unwrap_or_else(|| format_ident!("uuid"));
+    let has_body = op.request_body_type.is_some();
+
     let mut field_defs = Vec::new();
-    if let Some(field) = path_param_field(op, false) {
+    if has_body {
+        if let Some(field) = path_param_field(op, false) {
+            field_defs.push(field);
+        }
+    } else if let Some(field) = batch_path_param_field(op) {
         field_defs.push(field);
     }
 
-    let path_expr = build_path_expr(op)?;
     let method_expr = http_method_expr(op)?;
     let method_str = op.http_verb.to_uppercase();
 
     let (output_stmt, struct_attr, consts) = match op.request_body_type.as_deref() {
         Some(type_name) => {
+            let path_expr = build_path_expr(op)?;
             field_defs.push(quote! {
                 /// Request body as inline JSON. Use --generate-skeleton for
                 /// a template, or --request-file to read it from a file.
@@ -971,13 +1043,30 @@ fn emit_action_verb(
             (stmt, struct_attr, consts)
         }
         None => {
+            // Batched, like `delete`: no request body means every UUID in
+            // the batch is an identical call, so this is just `resolve_uuids`
+            // + a per-item loop that keeps going past individual failures.
+            let path_expr = build_path_expr_for_ident(op, &uuid_ident)?;
             let stmt = quote! {
-                let path = #path_expr;
-                if dry_run {
-                    return crate::output::print_dry_run(#method_str, &path, None, format);
+                let uuids = crate::batch::resolve_uuids(args.#uuid_ident)?;
+                let mut failed = Vec::new();
+                for #uuid_ident in uuids {
+                    let path = #path_expr;
+                    if dry_run {
+                        crate::output::print_dry_run(#method_str, &path, None, format)?;
+                        continue;
+                    }
+                    match crate::http::call_one(base_url, token, #method_expr, &path, None).await {
+                        Ok(result) => crate::output::print_result(&result, COLUMNS, format)?,
+                        Err(err) => {
+                            crate::batch::report_error(&#uuid_ident, &err);
+                            failed.push(#uuid_ident);
+                        }
+                    }
                 }
-                let result = crate::http::call_one(base_url, token, #method_expr, &path, None).await?;
-                crate::output::print_result(&result, COLUMNS, format)?;
+                if !failed.is_empty() {
+                    anyhow::bail!("{} of the batch failed: {}", failed.len(), failed.join(", "));
+                }
             };
             (stmt, quote! {}, quote! {})
         }
@@ -1661,10 +1750,29 @@ mod tests {
 
         let emitted = emit_action_verb(&resource, "Thing", &ident, &start, &empty, &empty).unwrap();
         assert!(rendered(&emitted.variant).contains("Start (ThingStartArgs)"));
-        assert!(rendered(&emitted.args_struct).contains("pub uuid : String"));
+        // Batched -- Vec<String>, not a single required uuid -- so a
+        // bodyless action can operate on several UUIDs (or read them from
+        // stdin) in one invocation, same as `delete`.
+        assert!(rendered(&emitted.args_struct).contains("pub uuid : Vec < String >"));
         assert!(!rendered(&emitted.args_struct).contains("request"));
+        assert!(rendered(&emitted.arm).contains("crate :: batch :: resolve_uuids"));
         assert!(rendered(&emitted.arm).contains("call_one"));
         assert!(!emitted.needs_context);
+    }
+
+    #[test]
+    fn emit_action_verb_bodyless_action_continues_past_a_failed_item() {
+        let resource = resource("thing", &[], None);
+        let ident = format_ident!("ThingCommand");
+        let empty: HashMap<String, String> = HashMap::new();
+        let start = action("start", "/api/things/{uuid}/start/", "post", None);
+
+        let emitted = emit_action_verb(&resource, "Thing", &ident, &start, &empty, &empty).unwrap();
+        let rendered = rendered(&emitted.arm);
+        assert!(rendered.contains("for uuid in uuids"));
+        assert!(rendered.contains("crate :: batch :: report_error"));
+        assert!(rendered.contains("failed . push"));
+        assert!(rendered.contains("anyhow :: bail !"));
     }
 
     #[test]
@@ -1682,6 +1790,11 @@ mod tests {
         assert!(rendered(&emitted.consts).contains("CHANGE_FLAVOR_SKELETON"));
         assert!(rendered(&emitted.consts).contains("CHANGE_FLAVOR_REQUEST_SCHEMA"));
         assert!(rendered(&emitted.arm).contains("validate_request_body"));
+        // Not batched: a single `--request` body can't sensibly apply to
+        // several different UUIDs at once, so a body-having action keeps
+        // the plain single-uuid shape rather than `resolve_uuids`.
+        assert!(rendered(&emitted.args_struct).contains("pub uuid : String"));
+        assert!(!rendered(&emitted.arm).contains("resolve_uuids"));
     }
 
     #[test]
@@ -1693,6 +1806,54 @@ mod tests {
 
         let err = emit_action_verb(&resource, "Thing", &ident, &change, &empty, &empty).unwrap_err();
         assert!(err.to_string().contains("no skeleton built"));
+    }
+
+    // -- emit_delete_verb -------------------------------------------------
+
+    #[test]
+    fn emit_delete_verb_batches_over_a_vec_of_uuids() {
+        let resource = resource("thing", &[("delete", "things_delete")], None);
+        let ident = format_ident!("ThingCommand");
+        let op = op("/api/things/{uuid}/", "delete", Some("uuid"));
+
+        let emitted = emit_delete_verb(&resource, "Thing", &ident, &op, "things_delete").unwrap();
+        assert!(rendered(&emitted.variant).contains("Delete (ThingDeleteArgs)"));
+        assert!(rendered(&emitted.args_struct).contains("pub uuid : Vec < String >"));
+        let arm = rendered(&emitted.arm);
+        assert!(arm.contains("crate :: batch :: resolve_uuids"));
+        assert!(arm.contains("for uuid in uuids"));
+    }
+
+    #[test]
+    fn emit_delete_verb_continues_past_a_failed_item_and_reports_it() {
+        let resource = resource("thing", &[("delete", "things_delete")], None);
+        let ident = format_ident!("ThingCommand");
+        let op = op("/api/things/{uuid}/", "delete", Some("uuid"));
+
+        let emitted = emit_delete_verb(&resource, "Thing", &ident, &op, "things_delete").unwrap();
+        let arm = rendered(&emitted.arm);
+        assert!(arm.contains("crate :: batch :: report_error"));
+        assert!(arm.contains("failed . push"));
+        assert!(arm.contains("anyhow :: bail !"));
+        // The success/error match happens per item inside the loop, not
+        // once for the whole batch.
+        assert!(arm.contains("Ok (_)"));
+        assert!(arm.contains("Err (err)"));
+    }
+
+    #[test]
+    fn emit_delete_verb_dry_run_continues_the_loop_instead_of_returning() {
+        let resource = resource("thing", &[("delete", "things_delete")], None);
+        let ident = format_ident!("ThingCommand");
+        let op = op("/api/things/{uuid}/", "delete", Some("uuid"));
+
+        let emitted = emit_delete_verb(&resource, "Thing", &ident, &op, "things_delete").unwrap();
+        let arm = rendered(&emitted.arm);
+        // Every item in the batch should get its own dry-run preview, not
+        // just the first (which an early `return` would produce).
+        assert!(arm.contains("print_dry_run"));
+        assert!(!arm.contains("return crate :: output :: print_dry_run"));
+        assert!(arm.contains("continue"));
     }
 
     #[test]
