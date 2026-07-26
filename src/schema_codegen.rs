@@ -392,6 +392,44 @@ pub fn build_schema_json(
         "type": "meta",
         "parameters": []
     }));
+    commands.push(json!({
+        "path": ["api"],
+        "description": "Call an arbitrary Waldur API endpoint directly -- an escape hatch for \
+                         endpoints not wired up as a typed command yet, or quick one-off debugging. \
+                         No schema validation: a malformed --request fails server-side, same as curl",
+        "type": "meta",
+        "parameters": [
+            {
+                "name": "method",
+                "type": "string",
+                "positional": true,
+                "required": true,
+                "description": "HTTP method (GET, POST, PUT, PATCH, DELETE; case-insensitive)"
+            },
+            {
+                "name": "path",
+                "type": "string",
+                "positional": true,
+                "required": true,
+                "description": "API path, relative to --api-url (e.g. /api/customers/)"
+            },
+            {
+                "name": "--request",
+                "type": "string",
+                "description": "Request body as inline JSON"
+            },
+            {
+                "name": "--request-file",
+                "type": "string",
+                "description": "Read the request body from a JSON or YAML file"
+            },
+            {
+                "name": "--jmespath",
+                "type": "string",
+                "description": "Reshape the response with a JMESPath expression"
+            }
+        ]
+    }));
 
     // Build the groups summary for compact mode and general introspection.
     let groups: Vec<Value> = manifest
@@ -601,7 +639,7 @@ mod tests {
         find(&["team", "tenant", "terminate"]).expect("terminate command present");
 
         // Hand-written meta-commands are always present.
-        for path in [["schema"].as_slice(), &["completions"], &["login"], &["logout"], &["whoami"]] {
+        for path in [["schema"].as_slice(), &["completions"], &["login"], &["logout"], &["whoami"], &["api"]] {
             assert!(
                 commands.iter().any(|c| c["path"].as_array().unwrap().iter().map(|v| v.as_str().unwrap()).eq(path.iter().copied())),
                 "missing meta-command {path:?}"
