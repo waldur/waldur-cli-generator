@@ -56,6 +56,12 @@ Generate CLI:
     # "Upload OpenAPI schema..." job) -- CI_JOB_TOKEN's cross-project access
     # is scoped per-project and isn't reliably allow-listed, which is
     # exactly what broke .fetch-openapi-schema's internal-API path earlier.
+    # This runner's build directory persists across pipeline runs (GitLab's
+    # own git checkout only cleans the project's own tree, not a sibling
+    # directory like ../waldur-cli) -- clear a leftover clone from an
+    # earlier run first, so this step is idempotent rather than failing
+    # with "destination path already exists".
+    - rm -rf ../waldur-cli
     - git clone "https://gitlab-ci-token:${GITLAB_TOKEN}@${CI_SERVER_HOST}/waldur/waldur-cli.git" ../waldur-cli
     # waldur-openapi-schema.yaml is downloaded automatically from needs --
     # the sole source of truth for command generation, no other checkout
