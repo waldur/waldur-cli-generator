@@ -180,6 +180,9 @@ about = "Manage OpenStack resources"
   name = "floating-ip"
   about = "OpenStack floating IPs"
   columns = ["uuid", "address", "state", "project_name"]
+  # Created asynchronously by `tenant create-floating-ip`, like the
+  # networking resources above.
+  wait = true
     [group.resource.commands]
     operation_prefix = "openstack_floating_ips"
     exclude = ["create", "update"]
