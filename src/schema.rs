@@ -159,7 +159,12 @@ pub struct ExtractedOperation {
     pub order_enum_name: Option<String>,
     /// Name of the request body schema (e.g. `"CustomerRequest"`), resolved
     /// per-operation -- never guessed from the resource name, since it
-    /// genuinely diverges (see e.g. `role.rs`'s `RoleModifyRequest`).
+    /// genuinely diverges (see e.g. `role.rs`'s `RoleModifyRequest`). A body
+    /// that is a JSON array of that schema (a DRF `many=True` serializer,
+    /// e.g. a security group's `set_rules`) is spelled `"Name[]"` -- the
+    /// suffix travels with the name as the key into the skeleton/JSON-schema
+    /// maps, so an array body and a plain one of the same item type never
+    /// share a template.
     pub request_body_type: Option<String>,
 }
 
@@ -317,13 +322,7 @@ fn extract_from_found(
         }
     }
 
-    let request_body_type = op
-        .request_body
-        .as_ref()
-        .and_then(|body| body.content.get("application/json"))
-        .and_then(|media| media.schema.reference.as_deref())
-        .and_then(schema_ref_name)
-        .map(|s| s.to_string());
+    let request_body_type = request_body_type(operation_id, op)?;
 
     Ok(ExtractedOperation {
         operation_id: operation_id.to_string(),
@@ -336,6 +335,49 @@ fn extract_from_found(
         order_enum_name,
         request_body_type,
     })
+}
+
+/// Suffix marking a `request_body_type` as a JSON array of the named schema.
+const ARRAY_SUFFIX: &str = "[]";
+
+/// Resolves an operation's JSON request body to a `request_body_type`: the
+/// `$ref`'d schema's name, or `"Name[]"` for an array of one. Any other
+/// JSON body shape is a hard error rather than `None` -- `None` means
+/// "bodyless", so a body this generator can't model would otherwise be
+/// emitted as a bare POST that silently sends nothing (for `set_rules`,
+/// which overwrites every rule, that would be destructive).
+fn request_body_type(operation_id: &str, op: &RawOperation) -> Result<Option<String>> {
+    let Some(media) = op.request_body.as_ref().and_then(|body| body.content.get("application/json")) else {
+        return Ok(None);
+    };
+    let schema = &media.schema;
+    if let Some(name) = schema.reference.as_deref().and_then(schema_ref_name) {
+        return Ok(Some(name.to_string()));
+    }
+    if schema.schema_type.as_deref() == Some("array") {
+        if let Some(name) = schema
+            .items
+            .as_ref()
+            .and_then(|items| items.reference.as_deref())
+            .and_then(schema_ref_name)
+        {
+            return Ok(Some(format!("{name}{ARRAY_SUFFIX}")));
+        }
+    }
+    bail!(
+        "operation `{operation_id}` has an application/json request body that is neither a \
+         `$ref` nor an array of one -- exclude it in commands.toml, or extend \
+         `request_body_type()` in src/schema.rs to model it"
+    )
+}
+
+/// Splits a `request_body_type` into its schema name and whether the body is
+/// an array of it.
+fn split_request_body_type(request_body_type: &str) -> (&str, bool) {
+    match request_body_type.strip_suffix(ARRAY_SUFFIX) {
+        Some(name) => (name, true),
+        None => (request_body_type, false),
+    }
 }
 
 /// A discovered custom action: its own name (the CLI verb) alongside the
@@ -404,10 +446,16 @@ const SKELETON_MAX_DEPTH: usize = 12;
 /// style): every writable field of `schema_name` with a type-appropriate
 /// placeholder, as pretty-printed JSON. Emitted into the generated command
 /// so `--generate-skeleton` can print it without any runtime schema access.
-pub fn build_request_skeleton(doc: &OpenApiDoc, schema_name: &str) -> Result<String> {
-    let value = skeleton_for(doc, schema_name)?;
+/// Takes a `request_body_type`, so an array body (`"Name[]"`) gets a
+/// one-element array of the item template.
+pub fn build_request_skeleton(doc: &OpenApiDoc, request_body_type: &str) -> Result<String> {
+    let (schema_name, is_array) = split_request_body_type(request_body_type);
+    let mut value = skeleton_for(doc, schema_name)?;
+    if is_array {
+        value = serde_json::Value::Array(vec![value]);
+    }
     serde_json::to_string_pretty(&value)
-        .with_context(|| format!("serializing skeleton for `{schema_name}`"))
+        .with_context(|| format!("serializing skeleton for `{request_body_type}`"))
 }
 
 /// The skeleton for a named schema as a `serde_json::Value` (rather than a
@@ -456,8 +504,11 @@ pub fn build_order_skeleton(doc: &OpenApiDoc, offering_type: Option<&str>) -> Re
 /// Builds a self-contained JSON Schema (every `$ref` inlined, no external
 /// lookups needed at runtime) for `schema_name`, for `waldur-cli` to validate
 /// `--request` bodies against directly. Embedded as a `const` in generated
-/// code, the same way `build_request_skeleton`'s output is.
-pub fn build_request_json_schema(doc: &OpenApiDoc, schema_name: &str) -> Result<String> {
+/// code, the same way `build_request_skeleton`'s output is. Takes a
+/// `request_body_type`, so an array body (`"Name[]"`) validates as an array
+/// whose every item matches `Name`.
+pub fn build_request_json_schema(doc: &OpenApiDoc, request_body_type: &str) -> Result<String> {
+    let (schema_name, is_array) = split_request_body_type(request_body_type);
     let schema = doc
         .components
         .schemas
@@ -465,8 +516,11 @@ pub fn build_request_json_schema(doc: &OpenApiDoc, schema_name: &str) -> Result<
         .with_context(|| format!("schema `{schema_name}` not found"))?;
     let mut seen = std::collections::HashSet::new();
     seen.insert(schema_name.to_string());
-    let value = json_schema_value(doc, schema, &mut seen, 0);
-    serde_json::to_string(&value).with_context(|| format!("serializing JSON schema for `{schema_name}`"))
+    let mut value = json_schema_value(doc, schema, &mut seen, 0);
+    if is_array {
+        value = serde_json::json!({ "type": "array", "items": value });
+    }
+    serde_json::to_string(&value).with_context(|| format!("serializing JSON schema for `{request_body_type}`"))
 }
 
 /// The JSON-Schema-node counterpart of `skeleton_value`: unlike a skeleton
@@ -853,6 +907,65 @@ components: {}
         assert_eq!(op.request_body_type, None);
         assert_eq!(op.path_param, None);
         assert!(op.query_params.is_empty());
+    }
+
+    /// A doc whose only operation takes `body_schema` as its JSON request
+    /// body, plus a `RuleRequest` item schema for it to reference.
+    fn body_doc(body_schema: &str) -> OpenApiDoc {
+        doc(&format!(
+            r#"
+paths:
+  /api/things/{{uuid}}/set_rules/:
+    post:
+      operationId: things_set_rules
+      requestBody:
+        content:
+          application/json:
+            schema: {body_schema}
+components:
+  schemas:
+    RuleRequest:
+      type: object
+      required: [protocol]
+      properties:
+        protocol: {{type: string}}
+"#
+        ))
+    }
+
+    #[test]
+    fn extract_operation_array_of_ref_body_is_suffixed() {
+        let d = body_doc("{type: array, items: {$ref: '#/components/schemas/RuleRequest'}}");
+        let op = extract_operation(&d, "things_set_rules").unwrap();
+        assert_eq!(op.request_body_type.as_deref(), Some("RuleRequest[]"));
+    }
+
+    #[test]
+    fn extract_operation_unmodelable_json_body_is_an_error_not_bodyless() {
+        // Treating this as bodyless would emit a POST that sends nothing.
+        let d = body_doc("{type: object, additionalProperties: {type: integer}}");
+        let err = extract_operation(&d, "things_set_rules").unwrap_err();
+        assert!(format!("{err:#}").contains("neither a `$ref` nor an array of one"));
+    }
+
+    #[test]
+    fn build_request_skeleton_wraps_an_array_body_in_a_one_element_array() {
+        let d = body_doc("{type: array, items: {$ref: '#/components/schemas/RuleRequest'}}");
+        let skeleton: serde_json::Value =
+            serde_json::from_str(&build_request_skeleton(&d, "RuleRequest[]").unwrap()).unwrap();
+        assert_eq!(skeleton, serde_json::json!([{"protocol": ""}]));
+    }
+
+    #[test]
+    fn build_request_json_schema_validates_an_array_body_item_by_item() {
+        let d = body_doc("{type: array, items: {$ref: '#/components/schemas/RuleRequest'}}");
+        let schema: serde_json::Value =
+            serde_json::from_str(&build_request_json_schema(&d, "RuleRequest[]").unwrap()).unwrap();
+        assert_eq!(schema["type"], "array");
+        assert_eq!(schema["items"]["required"], serde_json::json!(["protocol"]));
+        let plain: serde_json::Value =
+            serde_json::from_str(&build_request_json_schema(&d, "RuleRequest").unwrap()).unwrap();
+        assert_eq!(plain["type"], "object");
     }
 
     // -- discover_actions -----------------------------------------------------

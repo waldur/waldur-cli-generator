@@ -973,7 +973,9 @@ fn emit_action_verb(
 
     let mut field_defs = Vec::new();
     if has_body {
-        if let Some(field) = path_param_field(op, false) {
+        // Optional, like `update`'s, so `--generate-skeleton` works without
+        // naming a resource; `body_path_stmts` requires it at send time.
+        if let Some(field) = path_param_field(op, true) {
             field_defs.push(field);
         }
     } else if let Some(field) = batch_path_param_field(op) {
@@ -985,7 +987,7 @@ fn emit_action_verb(
 
     let (output_stmt, struct_attr, consts) = match op.request_body_type.as_deref() {
         Some(type_name) => {
-            let path_expr = build_path_expr(op)?;
+            let path_stmts = body_path_stmts(op)?;
             field_defs.push(quote! {
                 /// Request body as inline JSON. Use --generate-skeleton for
                 /// a template, or --request-file to read it from a file.
@@ -1033,7 +1035,7 @@ fn emit_action_verb(
                 }
                 let body = crate::request::load_body(args.request.as_deref(), args.request_file.as_deref())?;
                 crate::request::validate_request_body(#schema_const_ident, &body)?;
-                let path = #path_expr;
+                #path_stmts
                 if dry_run {
                     return crate::output::print_dry_run(#method_str, &path, Some(&body), format);
                 }
@@ -1085,7 +1087,9 @@ fn emit_action_verb(
         }
     };
 
-    Ok(EmittedVerb { variant, arm, args_struct, consts, needs_context: false })
+    // body_path_stmts' uuid unwrap is a `.context(...)`.
+    let needs_context = has_body && op.path_param.is_some();
+    Ok(EmittedVerb { variant, arm, args_struct, consts, needs_context })
 }
 
 /// One resource's generated file: Args structs + Command enum + run().
@@ -1791,10 +1795,13 @@ mod tests {
         assert!(rendered(&emitted.consts).contains("CHANGE_FLAVOR_REQUEST_SCHEMA"));
         assert!(rendered(&emitted.arm).contains("validate_request_body"));
         // Not batched: a single `--request` body can't sensibly apply to
-        // several different UUIDs at once, so a body-having action keeps
-        // the plain single-uuid shape rather than `resolve_uuids`.
-        assert!(rendered(&emitted.args_struct).contains("pub uuid : String"));
+        // several different UUIDs at once, so a body-having action keeps a
+        // single uuid rather than `resolve_uuids` -- optional, like
+        // `update`'s, so `--generate-skeleton` doesn't demand one.
+        assert!(rendered(&emitted.args_struct).contains("pub uuid : Option < String >"));
         assert!(!rendered(&emitted.arm).contains("resolve_uuids"));
+        assert!(rendered(&emitted.arm).contains("requires a <uuid> argument"));
+        assert!(emitted.needs_context);
     }
 
     #[test]
