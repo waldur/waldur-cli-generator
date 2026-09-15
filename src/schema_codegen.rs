@@ -8,7 +8,7 @@
 //! valid_values), output column info, and request skeletons/field metadata.
 
 use crate::manifest::{Manifest, KNOWN_VERBS};
-use crate::schema::{ExtractedOperation, ParamKind};
+use crate::schema::{ExtractedAction, ExtractedOperation, ParamKind};
 use anyhow::{Context, Result};
 use serde_json::{json, Value};
 use std::collections::HashMap;
@@ -23,6 +23,29 @@ fn filter_kind_str(kind: &ParamKind) -> Option<&'static str> {
     }
 }
 
+/// The `--request`/`--request-file`/`--generate-skeleton` trio every
+/// body-taking verb (create, update, a body-having action) accepts.
+fn request_body_params() -> [Value; 3] {
+    [
+        json!({
+            "name": "--request",
+            "type": "json",
+            "description": "Request body as inline JSON"
+        }),
+        json!({
+            "name": "--request-file",
+            "type": "path",
+            "description": "Read the request body from a JSON or YAML file"
+        }),
+        json!({
+            "name": "--generate-skeleton",
+            "type": "enum",
+            "description": "Print a fillable request-body template and exit",
+            "valid_values": ["json", "yaml"]
+        }),
+    ]
+}
+
 /// Builds the complete CLI schema JSON from the same data the rest of the
 /// codegen pipeline works with.
 pub fn build_schema_json(
@@ -31,6 +54,7 @@ pub fn build_schema_json(
     field_enum_values: &HashMap<String, Vec<String>>,
     request_skeletons: &HashMap<String, String>,
     order_skeletons: &HashMap<String, String>,
+    resource_actions: &HashMap<String, Vec<ExtractedAction>>,
     cli_version: &str,
 ) -> Result<Value> {
     let mut commands = Vec::new();
@@ -139,22 +163,7 @@ pub fn build_schema_json(
                                 }));
                             }
                         }
-                        params.push(json!({
-                            "name": "--request",
-                            "type": "json",
-                            "description": "Request body as inline JSON"
-                        }));
-                        params.push(json!({
-                            "name": "--request-file",
-                            "type": "path",
-                            "description": "Read the request body from a JSON or YAML file"
-                        }));
-                        params.push(json!({
-                            "name": "--generate-skeleton",
-                            "type": "enum",
-                            "description": "Print a fillable request-body template and exit",
-                            "valid_values": ["json", "yaml"]
-                        }));
+                        params.extend(request_body_params());
                     }
                     "delete" => {
                         if let Some(param_name) = &op.path_param {
@@ -320,6 +329,63 @@ pub fn build_schema_json(
                     }));
                 }
             }
+
+            // Auto-discovered custom actions (start/stop, create-network,
+            // set-rules, ...), mirroring codegen's `emit_action_verb`: a
+            // body-having action takes one optional uuid plus a request body;
+            // a bodyless one is batched over uuids (or stdin).
+            for action in resource_actions.get(&resource.name).into_iter().flatten() {
+                let op = &action.operation;
+                let mut params = Vec::new();
+                match &op.request_body_type {
+                    Some(_) => {
+                        if let Some(param_name) = &op.path_param {
+                            params.push(json!({
+                                "name": param_name,
+                                "type": "string",
+                                "positional": true,
+                                "required": false,
+                                "description": format!("{param_name} of the resource (required unless --generate-skeleton)")
+                            }));
+                        }
+                        params.extend(request_body_params());
+                    }
+                    None => {
+                        if let Some(param_name) = &op.path_param {
+                            params.push(json!({
+                                "name": param_name,
+                                "type": "string",
+                                "positional": true,
+                                "required": false,
+                                "repeatable": true,
+                                "description": format!("{param_name}(s) to operate on; omit to read them from stdin, one per line")
+                            }));
+                        }
+                    }
+                }
+                params.push(json!({
+                    "name": "--format",
+                    "type": "string",
+                    "global": true,
+                    "description": "Output format",
+                    "valid_values": ["table", "json", "tsv", "toon", "ndjson"]
+                }));
+
+                let mut cmd_json = json!({
+                    "path": [group.name.clone(), resource.name.clone(), action.name.replace('_', "-")],
+                    "description": format!("{} {}", capitalize(&action.name.replace('_', " ")), resource.about.to_lowercase()),
+                    "type": "action",
+                    "api_endpoint": op.path,
+                    "http_method": op.http_verb.to_uppercase(),
+                    "parameters": params
+                });
+                if let Some(skeleton_str) = op.request_body_type.as_ref().and_then(|t| request_skeletons.get(t)) {
+                    if let Ok(skeleton_val) = serde_json::from_str::<Value>(skeleton_str) {
+                        cmd_json["request_skeleton"] = skeleton_val;
+                    }
+                }
+                commands.push(cmd_json);
+            }
         }
     }
 
@@ -449,6 +515,13 @@ pub fn build_schema_json(
                                 .as_ref()
                                 .map(|_| vec!["provision".to_string(), "terminate".to_string()])
                                 .unwrap_or_default(),
+                        )
+                        .chain(
+                            resource_actions
+                                .get(&r.name)
+                                .into_iter()
+                                .flatten()
+                                .map(|a| a.name.replace('_', "-")),
                         )
                         .collect();
                     json!({
@@ -595,8 +668,31 @@ mod tests {
         request_skeletons.insert("CustomerRequest".to_string(), r#"{"name": ""}"#.to_string());
         let mut order_skeletons = HashMap::new();
         order_skeletons.insert("tenant".to_string(), r#"{"offering": ""}"#.to_string());
+        request_skeletons.insert("NetworkRequest".to_string(), r#"{"name": ""}"#.to_string());
+        let resource_actions = HashMap::from([(
+            "tenant".to_string(),
+            vec![
+                ExtractedAction {
+                    name: "create_network".to_string(),
+                    operation: op("/api/tenants/{uuid}/create_network/", "post", Some("uuid"), Some("NetworkRequest")),
+                },
+                ExtractedAction {
+                    name: "set_ok".to_string(),
+                    operation: op("/api/tenants/{uuid}/set_ok/", "post", Some("uuid"), None),
+                },
+            ],
+        )]);
 
-        let schema = build_schema_json(&manifest, &operations, &field_enum_values, &request_skeletons, &order_skeletons, "1.2.3").unwrap();
+        let schema = build_schema_json(
+            &manifest,
+            &operations,
+            &field_enum_values,
+            &request_skeletons,
+            &order_skeletons,
+            &resource_actions,
+            "1.2.3",
+        )
+        .unwrap();
 
         assert_eq!(schema["version"], json!("1.2.3"));
 
@@ -638,6 +734,18 @@ mod tests {
         assert_eq!(provision["request_skeleton"], json!({"offering": ""}));
         find(&["team", "tenant", "terminate"]).expect("terminate command present");
 
+        // Actions are listed under their kebab-case CLI verb. A body-having
+        // one embeds its skeleton and doesn't require the uuid; a bodyless
+        // one takes repeatable uuids and no request body.
+        let create_network = find(&["team", "tenant", "create-network"]).expect("body action present");
+        assert_eq!(create_network["type"], json!("action"));
+        assert_eq!(create_network["http_method"], json!("POST"));
+        assert_eq!(create_network["request_skeleton"], json!({"name": ""}));
+        assert_eq!(create_network["parameters"][0]["required"], json!(false));
+        let set_ok = find(&["team", "tenant", "set-ok"]).expect("bodyless action present");
+        assert_eq!(set_ok["parameters"][0]["repeatable"], json!(true));
+        assert!(set_ok["parameters"].as_array().unwrap().iter().all(|p| p["name"] != "--request"));
+
         // Hand-written meta-commands are always present.
         for path in [["schema"].as_slice(), &["completions"], &["login"], &["logout"], &["whoami"], &["api"]] {
             assert!(
@@ -660,6 +768,8 @@ mod tests {
         assert!(verbs.contains(&"get"));
         assert!(verbs.contains(&"provision"));
         assert!(verbs.contains(&"terminate"));
+        assert!(verbs.contains(&"create-network"));
+        assert!(verbs.contains(&"set-ok"));
     }
 
     #[test]
@@ -672,7 +782,16 @@ mod tests {
             }],
         };
         let operations = HashMap::new(); // customers_get was never extracted
-        let err = build_schema_json(&manifest, &operations, &HashMap::new(), &HashMap::new(), &HashMap::new(), "0.0.0").unwrap_err();
+        let err = build_schema_json(
+            &manifest,
+            &operations,
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            "0.0.0",
+        )
+        .unwrap_err();
         assert!(err.to_string().contains("customers_get"));
     }
 }
