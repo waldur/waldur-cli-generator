@@ -209,6 +209,7 @@ fn main() -> Result<()> {
         &field_enum_values,
         &request_skeletons,
         &order_skeletons,
+        &resource_actions,
         &cli_version,
     )
     .context("building CLI schema JSON")?;

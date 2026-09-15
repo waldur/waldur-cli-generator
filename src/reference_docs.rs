@@ -475,7 +475,11 @@ fn action_page(
                 "# `{cmd}`\n\n{about}.\n\n## Usage\n\n```bash\n{cmd} <UUID> (--request JSON | --request-file PATH | --generate-skeleton)\n```\n"
             );
             md += &options_table(&[
-                ("<UUID>".into(), "positional, required".into(), "uuid of the resource.".into()),
+                (
+                    "<UUID>".into(),
+                    "positional".into(),
+                    "Required unless --generate-skeleton (the template doesn't need a specific resource).".into(),
+                ),
                 ("--request JSON".into(), "string".into(), "Request body as inline JSON.".into()),
                 (
                     "--request-file PATH".into(),
@@ -490,7 +494,7 @@ fn action_page(
             ]);
             let skeleton = request_skeletons.get(type_name).map(String::as_str);
             md += &format!(
-                "\n## Examples\n\n```bash\n{cmd} <uuid> --generate-skeleton\n```\n"
+                "\n## Examples\n\n```bash\n{cmd} --generate-skeleton\n```\n"
             );
             if let Some(skeleton) = skeleton {
                 md += &format!(

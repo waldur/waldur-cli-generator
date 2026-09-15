@@ -37,6 +37,30 @@ about = "Manage OpenStack resources"
     exclude = ["create", "delete"]
     [group.resource.order]
     offering_type = "OpenStack.Tenant"
+    [group.resource.actions]
+    # Networks, security groups, floating IPs and server groups have no
+    # REST create of their own -- Waldur creates them through these
+    # tenant-scoped actions (`tenant create-network <tenant-uuid> ...`), so
+    # unlike the instance's, the body-having ones are the point here.
+    # Excluded: Waldur's pull/push sync housekeeping (`push_security_groups`
+    # replaces every group in the tenant at once), provider-side operations
+    # (`set_quotas`, whose free-form body the generator can't model anyway;
+    # `change_password`; `set_erred`), and GET read-outs (`backend_*`,
+    # `topology`).
+    exclude = [
+      "pull",
+      "pull_floating_ips",
+      "pull_quotas",
+      "pull_security_groups",
+      "pull_server_groups",
+      "push_security_groups",
+      "set_quotas",
+      "change_password",
+      "set_erred",
+      "backend_instances",
+      "backend_volumes",
+      "topology",
+    ]
     [group.resource.web]
     # HomePort has no dedicated OpenStack-resource route -- it shows these
     # through the generic marketplace resource-details page, keyed by the
@@ -110,25 +134,47 @@ about = "Manage OpenStack resources"
   name = "network"
   about = "OpenStack networks"
   columns = ["uuid", "name", "state", "project_name"]
+  # Created asynchronously (Creating -> OK) by an executor, and
+  # `create-subnet` refuses a network that isn't OK yet -- so a script
+  # needs `wait` between the two. Same for the other networking resources
+  # below, which aren't marketplace-ordered and so don't get it by default.
+  wait = true
     [group.resource.commands]
+    # Created with `tenant create-network`, not a REST create.
     operation_prefix = "openstack_networks"
     exclude = ["create"]
+    [group.resource.actions]
+    # `create_subnet` is how a subnet is created. `rbac_policy_create` is
+    # deprecated server-side in favour of the network RBAC policy API.
+    exclude = ["pull", "rbac_policy_create", "set_erred"]
 
   [[group.resource]]
   name = "subnet"
   about = "OpenStack subnets"
   columns = ["uuid", "name", "state", "cidr"]
+  wait = true
     [group.resource.commands]
+    # Created with `network create-subnet`, not a REST create.
     operation_prefix = "openstack_subnets"
     exclude = ["create"]
+    [group.resource.actions]
+    # connect/disconnect attach the subnet to (or detach it from) the
+    # tenant's router.
+    exclude = ["pull", "set_erred"]
 
   [[group.resource]]
   name = "security-group"
   about = "OpenStack security groups"
   columns = ["uuid", "name", "state", "project_name"]
+  wait = true
     [group.resource.commands]
+    # Created with `tenant create-security-group`, not a REST create.
     operation_prefix = "openstack_security_groups"
     exclude = ["create"]
+    [group.resource.actions]
+    # `set_rules` takes a JSON *array* of rules and replaces the group's
+    # whole rule set with it.
+    exclude = ["pull", "set_erred"]
 
   [[group.resource]]
   name = "floating-ip"
@@ -142,6 +188,34 @@ about = "Manage OpenStack resources"
     # actions comment above for the rationale); body-having actions
     # (attach_to_port/set_erred/update_description) are excluded for now.
     exclude = ["pull", "attach_to_port", "set_erred", "update_description"]
+
+  # No PUT/PATCH: a router is changed only through its actions (interfaces,
+  # external gateway, static routes).
+  [[group.resource]]
+  name = "router"
+  about = "OpenStack routers"
+  columns = ["uuid", "name", "state", "tenant_name"]
+  wait = true
+    [group.resource.commands]
+    operation_prefix = "openstack_routers"
+    exclude = ["update"]
+    [group.resource.actions]
+    # GET read-outs (`available_external_networks`, `effective_routes`)
+    # are excluded along with `set_erred`.
+    exclude = ["set_erred", "available_external_networks", "effective_routes"]
+
+  [[group.resource]]
+  name = "port"
+  about = "OpenStack ports"
+  columns = ["uuid", "name", "state", "network_name"]
+  wait = true
+    [group.resource.commands]
+    operation_prefix = "openstack_ports"
+    [group.resource.actions]
+    # Port security and allowed address pairs are what a VM routing or
+    # bridging traffic that isn't its own (a nested cloud, a VPN gateway)
+    # needs switched off or widened.
+    exclude = ["pull", "set_erred"]
 
   # Read-only catalog data, not managed resources: you list these to pick the
   # `flavor`/`image` URLs an instance `provision` order needs. Without them
