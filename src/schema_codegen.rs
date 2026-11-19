@@ -379,6 +379,9 @@ pub fn build_schema_json(
                     "http_method": op.http_verb.to_uppercase(),
                     "parameters": params
                 });
+                if let Some(columns) = resource.actions.as_ref().and_then(|a| a.columns.get(&action.name)) {
+                    cmd_json["output"] = json!({ "default_columns": columns });
+                }
                 if let Some(skeleton_str) = op.request_body_type.as_ref().and_then(|t| request_skeletons.get(t)) {
                     if let Ok(skeleton_val) = serde_json::from_str::<Value>(skeleton_str) {
                         cmd_json["request_skeleton"] = skeleton_val;

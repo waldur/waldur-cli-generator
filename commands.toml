@@ -429,6 +429,13 @@ about = "Browse offerings and provision resources of any offering type"
       "set_ok",
       "set_paused",
     ]
+    [group.resource.actions.columns]
+    # The key's own columns leave out the secret, and table/tsv print only
+    # these -- so reveal names its own: `reveal <uuid> --format tsv` is
+    # `uuid<TAB>client_id<TAB>api_key`. rotate answers with an
+    # acknowledgement (`{"status": ...}`), not the key.
+    reveal = ["uuid", "client_id", "api_key"]
+    rotate = ["status"]
 
 [[group]]
 name = "auth"
