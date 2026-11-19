@@ -388,6 +388,55 @@ about = "Browse offerings and provision resources of any offering type"
     # From waldur-homeport's src/marketplace/routes.ts.
     path = "/marketplace-order-details/{uuid}/"
 
+  # Credentials a resource's site agent issues for it (an S3 resource's
+  # access keys, for instance). `client_id` is the public half and is in
+  # every list/get row; the secret is only ever returned by `reveal`, which
+  # is what lets a CI/CD pipeline that ordered a resource pick up its
+  # credentials without leaving the terminal: `list --filter resource_uuid=
+  # ... --filter state=OK`, then `reveal <uuid>`.
+  [[group.resource]]
+  name = "api-key"
+  about = "Resource API keys (credentials issued for a marketplace resource)"
+  columns = ["uuid", "client_id", "state", "resource_name"]
+  # A key's value is set asynchronously by the site agent (Creating ->
+  # OK on issue, Updating -> OK with `pending_action` "rotate" on rotate),
+  # so revealing straight after `rotate` returns the old secret -- `wait
+  # <uuid> --jmespath "state=='OK' && !pending_action"` first.
+  wait = true
+    [group.resource.commands]
+    # Keys are issued and removed by the resource's site agent, and their
+    # description/limits are managed in HomePort -- the CLI only reads them
+    # and reveals or rotates one.
+    operation_prefix = "marketplace_resource_api_keys"
+    exclude = ["create", "update", "delete"]
+    [group.resource.actions]
+    # Only `reveal` (POST, bodyless: returns the key with its secret in
+    # `api_key`) and `rotate` (POST, bodyless: asks the site agent to
+    # replace this key's value; poll `get` until `pending_action` clears).
+    # The deprecated `GET .../reveal/` is skipped by discovery. Excluded:
+    # the site agent's own state reports (`set_*`, `report_usage`), and,
+    # for now, pause/resume/retry -- bodyless too, but a pipeline that
+    # picks up its credentials needs only reveal and rotate; drop them from
+    # this list to add them.
+    exclude = [
+      "pause",
+      "resume",
+      "retry",
+      "report_usage",
+      "set_deleted",
+      "set_erred",
+      "set_key",
+      "set_ok",
+      "set_paused",
+    ]
+    [group.resource.actions.columns]
+    # The key's own columns leave out the secret, and table/tsv print only
+    # these -- so reveal names its own: `reveal <uuid> --format tsv` is
+    # `uuid<TAB>client_id<TAB>api_key`. rotate answers with an
+    # acknowledgement (`{"status": ...}`), not the key.
+    reveal = ["uuid", "client_id", "api_key"]
+    rotate = ["status"]
+
 [[group]]
 name = "auth"
 about = "Manage your own authentication credentials (personal access tokens, SSH keys)"

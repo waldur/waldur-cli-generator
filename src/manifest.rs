@@ -89,10 +89,52 @@ pub struct WebConfig {
 /// own `pull`/`sync_*` housekeeping actions, mostly), not an opt-in
 /// allow-list, so newly-added actions on the Waldur side show up on the
 /// next regen without needing a commands.toml change to notice them.
+///
+/// `columns` overrides, per action, the resource's own `columns` for that
+/// action's table/tsv output -- for an action whose response isn't the
+/// resource itself (a `{"status": ...}` acknowledgement), or carries a field
+/// the resource's rows never do (a revealed secret). Keyed by the action's
+/// name as discovered (`reveal`, `change_flavor`), not its CLI spelling.
 #[derive(Debug, Deserialize, Default)]
 pub struct ActionsConfig {
     #[serde(default)]
     pub exclude: Vec<String>,
+    #[serde(default)]
+    pub columns: BTreeMap<String, Vec<String>>,
+}
+
+impl Resource {
+    /// The table/tsv columns of one of this resource's discovered actions:
+    /// its `[actions.columns]` override if it has one, else the resource's
+    /// own `columns`.
+    pub fn action_columns(&self, action: &str) -> &[String] {
+        self.actions
+            .as_ref()
+            .and_then(|a| a.columns.get(action))
+            .map(Vec::as_slice)
+            .unwrap_or(&self.columns)
+    }
+}
+
+/// Fails if an `[actions.columns]` override names an action discovery did
+/// not find (a typo, an excluded action, one the schema dropped) or lists no
+/// columns -- either would otherwise be silently ignored.
+pub fn check_action_columns(resource: &Resource, discovered: &[&str]) -> anyhow::Result<()> {
+    let Some(actions) = &resource.actions else { return Ok(()) };
+    for (name, columns) in &actions.columns {
+        if !discovered.contains(&name.as_str()) {
+            anyhow::bail!(
+                "resource `{}`: [actions.columns] names `{name}`, which is not one of its \
+                 discovered actions ({})",
+                resource.name,
+                discovered.join(", ")
+            );
+        }
+        if columns.is_empty() {
+            anyhow::bail!("resource `{}`: [actions.columns] `{name}` lists no columns", resource.name);
+        }
+    }
+    Ok(())
 }
 
 /// Marketplace-order provisioning config for a resource. `offering_type`
@@ -232,6 +274,49 @@ exclude = ["create"]
         )
         .unwrap_err();
         assert!(err.to_string().contains("operation_prefix"));
+    }
+
+    // -- action columns -------------------------------------------------
+
+    fn resource_with_action_columns() -> Resource {
+        parse_resource(
+            r#"
+[commands]
+operation_prefix = "things"
+[actions]
+exclude = ["pull"]
+[actions.columns]
+reveal = ["uuid", "secret"]
+"#,
+        )
+    }
+
+    #[test]
+    fn action_columns_uses_the_override_else_the_resource_columns() {
+        let resource = resource_with_action_columns();
+        assert_eq!(resource.action_columns("reveal"), ["uuid".to_string(), "secret".to_string()]);
+        assert_eq!(resource.action_columns("start"), ["uuid".to_string()]);
+    }
+
+    #[test]
+    fn check_action_columns_accepts_a_discovered_action() {
+        let resource = resource_with_action_columns();
+        assert!(check_action_columns(&resource, &["reveal", "start"]).is_ok());
+    }
+
+    #[test]
+    fn check_action_columns_rejects_an_undiscovered_action() {
+        let resource = resource_with_action_columns();
+        let err = check_action_columns(&resource, &["start"]).unwrap_err();
+        assert!(err.to_string().contains("names `reveal`"));
+    }
+
+    #[test]
+    fn check_action_columns_rejects_an_empty_list() {
+        let mut resource = resource_with_action_columns();
+        resource.actions.as_mut().unwrap().columns.insert("start".to_string(), Vec::new());
+        let err = check_action_columns(&resource, &["reveal", "start"]).unwrap_err();
+        assert!(err.to_string().contains("lists no columns"));
     }
 
     // -- wants_wait -----------------------------------------------------

@@ -984,6 +984,15 @@ fn emit_action_verb(
 
     let method_expr = http_method_expr(op)?;
     let method_str = op.http_verb.to_uppercase();
+    // The resource's own COLUMNS, unless `[actions.columns]` overrides them
+    // for this action (a status-only response, or a field the resource's
+    // rows don't carry).
+    let action_columns = resource.action_columns(&action.name);
+    let columns_expr = if action_columns == resource.columns.as_slice() {
+        quote! { COLUMNS }
+    } else {
+        quote! { &[#(#action_columns),*] }
+    };
 
     let (output_stmt, struct_attr, consts) = match op.request_body_type.as_deref() {
         Some(type_name) => {
@@ -1040,7 +1049,7 @@ fn emit_action_verb(
                     return crate::output::print_dry_run(#method_str, &path, Some(&body), format);
                 }
                 let result = crate::http::call_one(base_url, token, #method_expr, &path, Some(&body)).await?;
-                crate::output::print_result(&result, COLUMNS, format)?;
+                crate::output::print_result(&result, #columns_expr, format)?;
             };
             (stmt, struct_attr, consts)
         }
@@ -1059,7 +1068,7 @@ fn emit_action_verb(
                         continue;
                     }
                     match crate::http::call_one(base_url, token, #method_expr, &path, None).await {
-                        Ok(result) => crate::output::print_result(&result, COLUMNS, format)?,
+                        Ok(result) => crate::output::print_result(&result, #columns_expr, format)?,
                         Err(err) => {
                             crate::batch::report_error(&#uuid_ident, &err);
                             failed.push(#uuid_ident);
@@ -1762,6 +1771,41 @@ mod tests {
         assert!(rendered(&emitted.arm).contains("crate :: batch :: resolve_uuids"));
         assert!(rendered(&emitted.arm).contains("call_one"));
         assert!(!emitted.needs_context);
+    }
+
+    #[test]
+    fn emit_action_verb_prints_the_resource_columns_by_default() {
+        let resource = resource("thing", &[], None);
+        let ident = format_ident!("ThingCommand");
+        let empty: HashMap<String, String> = HashMap::new();
+        let start = action("start", "/api/things/{uuid}/start/", "post", None);
+
+        let emitted = emit_action_verb(&resource, "Thing", &ident, &start, &empty, &empty).unwrap();
+        assert!(rendered(&emitted.arm).contains("print_result (& result , COLUMNS , format)"));
+    }
+
+    #[test]
+    fn emit_action_verb_prints_its_own_columns_when_overridden() {
+        let mut resource = resource("thing", &[], None);
+        resource.actions = Some(crate::manifest::ActionsConfig {
+            exclude: Vec::new(),
+            columns: BTreeMap::from([(
+                "reveal".to_string(),
+                vec!["client_id".to_string(), "api_key".to_string()],
+            )]),
+        });
+        let ident = format_ident!("ThingCommand");
+        let empty: HashMap<String, String> = HashMap::new();
+        let reveal = action("reveal", "/api/things/{uuid}/reveal/", "post", None);
+        let start = action("start", "/api/things/{uuid}/start/", "post", None);
+
+        let emitted = emit_action_verb(&resource, "Thing", &ident, &reveal, &empty, &empty).unwrap();
+        let arm = rendered(&emitted.arm);
+        assert!(arm.contains(r#"print_result (& result , & ["client_id" , "api_key"] , format)"#));
+        assert!(!arm.contains("COLUMNS"));
+        // Another action of the same resource keeps the resource's columns.
+        let emitted = emit_action_verb(&resource, "Thing", &ident, &start, &empty, &empty).unwrap();
+        assert!(rendered(&emitted.arm).contains("print_result (& result , COLUMNS , format)"));
     }
 
     #[test]

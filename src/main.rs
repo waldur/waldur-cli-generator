@@ -73,6 +73,8 @@ fn main() -> Result<()> {
         })?;
         let actions = schema::discover_actions(&doc, &get_op.path, &actions_config.exclude)
             .with_context(|| format!("discovering actions for resource `{}`", resource.name))?;
+        let discovered: Vec<&str> = actions.iter().map(|a| a.name.as_str()).collect();
+        manifest::check_action_columns(resource, &discovered)?;
         resource_actions.insert(resource.name.clone(), actions);
     }
     // Every discovered action's own ExtractedOperation, alongside the
