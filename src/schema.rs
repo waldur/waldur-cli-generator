@@ -29,6 +29,10 @@ pub struct RawOperation {
     pub parameters: Vec<RawParamOrRef>,
     #[serde(rename = "requestBody", default)]
     pub request_body: Option<RawRequestBody>,
+    /// OpenAPI's `deprecated: true`. Only consulted by `discover_actions`,
+    /// which never turns a deprecated operation into a new CLI verb.
+    #[serde(default)]
+    pub deprecated: bool,
 }
 
 /// A parameter entry is either inline or a bare `{"$ref": "..."}` (Waldur's
@@ -400,6 +404,13 @@ pub struct ExtractedAction {
 /// resource's actions. A path with its own further path parameter (a nested
 /// sub-resource, e.g. `{base_path}networks/{network_uuid}/`) is not an
 /// action and is skipped, not just one with more than one segment.
+///
+/// An operation marked `deprecated` is skipped too: it is on its way out,
+/// and when an action path keeps a deprecated method alongside its
+/// replacement (`GET` and `POST` at the same `reveal/`), both would
+/// otherwise claim the same CLI verb. Two live methods at one action path
+/// are a hard error rather than two colliding subcommands -- exclude the
+/// action in commands.toml if it can't be told apart.
 pub fn discover_actions(doc: &OpenApiDoc, base_path: &str, exclude: &[String]) -> Result<Vec<ExtractedAction>> {
     let mut actions = Vec::new();
     for (path, methods) in &doc.paths {
@@ -411,11 +422,18 @@ pub fn discover_actions(doc: &OpenApiDoc, base_path: &str, exclude: &[String]) -
         if name.is_empty() || name.contains('/') || exclude.contains(&name) {
             continue;
         }
-        for (verb, op) in methods {
-            let operation = extract_from_found(doc, path, verb, op)
-                .with_context(|| format!("discovering action `{name}` at `{path}`"))?;
-            actions.push(ExtractedAction { name: name.clone(), operation });
+        let mut live = methods.iter().filter(|(_, op)| !op.deprecated);
+        let Some((verb, op)) = live.next() else { continue };
+        if let Some((other, _)) = live.next() {
+            bail!(
+                "action `{name}` at `{path}` has more than one non-deprecated method \
+                 (`{verb}` and `{other}`) -- each would become the same CLI verb; \
+                 exclude it in commands.toml"
+            );
         }
+        let operation = extract_from_found(doc, path, verb, op)
+            .with_context(|| format!("discovering action `{name}` at `{path}`"))?;
+        actions.push(ExtractedAction { name, operation });
     }
     // Deterministic order across regenerations, independent of the source
     // HashMap's iteration order.
@@ -1023,6 +1041,50 @@ components: {}
             discover_actions(&d, "/api/things/{uuid}/", &["pull".to_string()]).unwrap();
         let names: Vec<&str> = actions.iter().map(|a| a.name.as_str()).collect();
         assert_eq!(names, vec!["start"]);
+    }
+
+    #[test]
+    fn discover_actions_skips_a_deprecated_method_next_to_its_replacement() {
+        let d = doc(
+            r#"
+paths:
+  /api/things/{uuid}/reveal/:
+    get:
+      operationId: things_reveal_retrieve
+      deprecated: true
+    post:
+      operationId: things_reveal
+  /api/things/{uuid}/old/:
+    post:
+      operationId: things_old
+      deprecated: true
+components: {}
+"#,
+        );
+        let actions = discover_actions(&d, "/api/things/{uuid}/", &[]).unwrap();
+        assert_eq!(actions.len(), 1);
+        assert_eq!(actions[0].name, "reveal");
+        assert_eq!(actions[0].operation.operation_id, "things_reveal");
+        assert_eq!(actions[0].operation.http_verb, "post");
+    }
+
+    #[test]
+    fn discover_actions_rejects_two_live_methods_at_one_action_path() {
+        let d = doc(
+            r#"
+paths:
+  /api/things/{uuid}/reveal/:
+    get:
+      operationId: things_reveal_retrieve
+    post:
+      operationId: things_reveal
+components: {}
+"#,
+        );
+        let err = discover_actions(&d, "/api/things/{uuid}/", &[]).unwrap_err();
+        assert!(err.to_string().contains("more than one non-deprecated method"));
+        // Excluding it is the way out.
+        assert!(discover_actions(&d, "/api/things/{uuid}/", &["reveal".to_string()]).unwrap().is_empty());
     }
 
     #[test]
